@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "ror"
-version = "0.1.0-rodeo.1"
+version = "0.1.0-rodeo.2"
 dependencies = [
  "anyhow",
  "ash",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "ror-assets"
-version = "0.1.0-rodeo.1"
+version = "0.1.0-rodeo.2"
 dependencies = [
  "flate2",
  "parking_lot",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "ror-image"
-version = "0.1.0-rodeo.1"
+version = "0.1.0-rodeo.2"
 dependencies = [
  "bcdec_rs",
  "flate2",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "ror-mesh"
-version = "0.1.0-rodeo.1"
+version = "0.1.0-rodeo.2"
 dependencies = [
  "draco-core",
  "lz4_flex",
