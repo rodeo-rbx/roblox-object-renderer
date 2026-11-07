@@ -17,9 +17,9 @@ toolchain is the main platform; macOS builds render through Metal and read built
   [rur](https://github.com/Anime-Vanguards/roblox-ui-renderer) (`ROR_RUR`, or `../roblox-ui-renderer`
   beside this checkout) and Node 18+; rur builds its native app on first use. Without it GUIs are
   skipped with a warning.
-- Optional, for `.luau` inputs: a checkout of
-  [ree](https://github.com/Anime-Vanguards/roblox-engine-emulator) (`ROR_REE`, or
-  `../roblox-engine-emulator`) built with `cargo build --release` ([scripts.md](scripts.md)).
+- Optional, for `.luau` inputs: [ree](https://github.com/Anime-Vanguards/roblox-engine-emulator):
+  `ROR_REE` (its binary, or a checkout built with `cargo build --release`), a checkout at
+  `../roblox-engine-emulator` built the same way, or `ree` on the PATH ([scripts.md](scripts.md)).
 - Optional: a Roblox account cookie for assets that need authentication, in this checkout's `.env`
   (`ROBLOX_ASSET_DELIVERY_COOKIE=...`, ignored by Git) or a file named by `ROR_COOKIE_ENV`. It is
   only ever sent to assetdelivery.roblox.com ([SECURITY.md](../SECURITY.md)).

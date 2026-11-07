@@ -47,5 +47,6 @@ ror video Build.luau --duration 2
   `script` entry in the CLI summary: the run's status, frames, instances and error lines (also printed
   as `ror: script error: ...`). This entry is saved in `record/script.json` too, including for
   `--sheet-first` videos. A run that puts nothing in the Workspace is an error naming why.
-- ree is `ROR_REE` (its checkout), else `../roblox-engine-emulator` beside this checkout, built with
-  `cargo build --release`.
+- ree is `ROR_REE` (its binary, or its checkout built with `cargo build --release`), else the
+  release build of `../roblox-engine-emulator` beside this checkout when ror runs from its checkout,
+  else `ree` on the PATH (a tool manager's install, pinned per project).

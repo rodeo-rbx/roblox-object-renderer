@@ -3,8 +3,10 @@
 //! that recording, its `scene.rbxm` with its `playback.json`. The script is a ree harness: a
 //! ModuleScript returning `function(Context)` that parents what it builds to the Workspace.
 //!
-//! ree is found through `ROR_REE` (its checkout), else beside this checkout
-//! (`../roblox-engine-emulator`); its release build is run as it is (`cargo build --release` there).
+//! ree is found through `ROR_REE` (its binary, or a checkout whose release build is run as it is:
+//! `cargo build --release` there), else the release build of a checkout beside this one
+//! (`../roblox-engine-emulator`) when ror runs from its checkout, else `ree` on the PATH (a tool
+//! manager's install, pinned per project).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,14 +20,26 @@ pub fn is_script(input: &str) -> bool {
 	lower.ends_with(".luau") || lower.ends_with(".lua")
 }
 
-/// ree's release binary, if there is one.
+/// ree's binary, if there is one (the module's doc says where it is looked for).
 pub fn locate() -> Option<PathBuf> {
-	let checkout = match std::env::var_os("ROR_REE") {
-		Some(path) if !path.is_empty() => PathBuf::from(path),
-		_ => crate::output::repo_dir().join("..").join("roblox-engine-emulator"),
-	};
-	let binary = crate::output::plain_path(&checkout).join("target").join("release").join(if cfg!(windows) { "ree.exe" } else { "ree" });
-	binary.is_file().then_some(binary)
+	let checkout = std::env::current_exe().ok().and_then(|exe| crate::output::checkout_of(&exe));
+	locate_from(std::env::var_os("ROR_REE"), checkout.as_deref(), std::env::var_os("PATH"))
+}
+
+/// [`locate`] with its inputs given: `ROR_REE`, the checkout ror runs from (none for a binary outside
+/// one, whose working directory says nothing of where ree is) and the PATH. A `ROR_REE` naming nothing
+/// runnable finds nothing rather than another ree.
+fn locate_from(given: Option<std::ffi::OsString>, checkout: Option<&Path>, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+	let name = if cfg!(windows) { "ree.exe" } else { "ree" };
+	let release = |checkout: &Path| crate::output::plain_path(checkout).join("target").join("release").join(name);
+	if let Some(given) = given.filter(|given| !given.is_empty()).map(PathBuf::from) {
+		let binary = if given.is_file() { crate::output::plain_path(&given) } else { release(&given) };
+		return binary.is_file().then_some(binary);
+	}
+	if let Some(beside) = checkout.map(|checkout| release(&checkout.join("..").join("roblox-engine-emulator"))).filter(|binary| binary.is_file()) {
+		return Some(beside);
+	}
+	std::env::split_paths(&path?).map(|dir| dir.join(name)).find(|binary| binary.is_file())
 }
 
 /// What a script's run is given: `--context` (its Context fields, JSON) and `--mount`
@@ -56,7 +70,7 @@ pub fn record(script: &Path, seconds: f32, options: &Options, out: &Path) -> Res
 		bail!("{}: no such script", script.display());
 	}
 	let ree = locate().context(
-		"a .luau input runs in the engine emulator, which was not found: set ROR_REE to a roblox-engine-emulator checkout built with `cargo build --release`, or put one beside this checkout",
+		"a .luau input runs in the engine emulator, which was not found: set ROR_REE to ree's binary or to a roblox-engine-emulator checkout built with `cargo build --release`, put such a checkout beside this one, or put ree on the PATH",
 	)?;
 	let mut command = Command::new(&ree);
 	command.arg("record").arg("--harness").arg(crate::output::plain_path(script)).arg("--out").arg(out).arg(format!("--seconds={seconds}"));
@@ -110,4 +124,44 @@ pub fn record(script: &Path, seconds: f32, options: &Options, out: &Path) -> Res
 	});
 	crate::output::write_json_atomic(&out.join("script.json"), &report, true)?;
 	Ok(Recording { scene: out.join("scene.rbxm"), playback: out.join("playback.json"), report, errors })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ree_is_ror_ree_else_a_checkout_beside_ror_s_else_on_the_path() {
+		let name = if cfg!(windows) { "ree.exe" } else { "ree" };
+		let root = std::env::temp_dir().join(format!("ror-locate-ree-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let ror = root.join("ror");
+		let beside = root.join("roblox-engine-emulator").join("target").join("release");
+		let installed = root.join("installs").join("ree");
+		let elsewhere = root.join("elsewhere");
+		for dir in [&ror, &beside, &installed, &elsewhere] {
+			std::fs::create_dir_all(dir).unwrap();
+		}
+		std::fs::write(installed.join(name), "").unwrap();
+		let path = Some(std::env::join_paths([&elsewhere, &installed]).unwrap());
+		let found = |given: Option<&Path>, checkout: Option<&Path>, path: Option<std::ffi::OsString>| locate_from(given.map(|given| given.as_os_str().to_owned()), checkout, path);
+
+		// on the PATH: a binary outside any checkout, or a checkout with no ree built beside it
+		assert_eq!(found(None, None, path.clone()), Some(installed.join(name)));
+		assert_eq!(found(None, Some(&ror), path.clone()), Some(installed.join(name)));
+		assert_eq!(found(None, None, None), None);
+		// a ree built beside ror's checkout comes before the PATH's, but only for ror run from its checkout
+		std::fs::write(beside.join(name), "").unwrap();
+		assert_eq!(found(None, Some(&ror), path.clone()), Some(crate::output::plain_path(&ror.join("..").join("roblox-engine-emulator")).join("target").join("release").join(name)));
+		assert_eq!(found(None, None, path.clone()), Some(installed.join(name)));
+		// ROR_REE comes first: ree's binary, or a checkout's release build
+		assert_eq!(found(Some(&installed.join(name)), Some(&ror), None), Some(installed.join(name)));
+		assert_eq!(found(Some(&root.join("roblox-engine-emulator")), None, path.clone()), Some(beside.join(name)));
+		// and names the one to run: nothing there finds nothing, not another ree
+		assert_eq!(found(Some(&elsewhere), Some(&ror), path.clone()), None);
+		assert_eq!(found(Some(&elsewhere.join(name)), None, path.clone()), None);
+		// an empty ROR_REE is unset
+		assert_eq!(found(Some(Path::new("")), None, path), Some(installed.join(name)));
+		std::fs::remove_dir_all(&root).unwrap();
+	}
 }
