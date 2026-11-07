@@ -1,0 +1,122 @@
+# The fork's releases: for every tag shaped like v0.1.0-rodeo.1, ror's binaries attached to a GitHub
+# release, named so mise (github: or ubi: backend) picks the right one per platform:
+#
+#   ror-v0.1.0-rodeo.1-macos-aarch64.tar.gz
+#   ror-v0.1.0-rodeo.1-macos-x86_64.tar.gz
+#   ror-v0.1.0-rodeo.1-windows-x86_64.zip
+#
+# Each archive holds the binary with LICENSE, NOTICE and THIRD_PARTY_NOTICES.md: a ror binary is
+# distributed under GPL-3.0-or-later (README, "Contributing, security and license"), and its source is
+# the tag's. It is built with the `dist` profile (thin LTO, stripped) and without the `x264` feature,
+# so MP4s go through ffmpeg. Linux is left out: ror is not tested there.
+#
+# Cutting a release: set `version` in Cargo.toml's [workspace.package] to the release's (upstream's
+# base version and the fork's count, 0.1.0-rodeo.1), commit, then `git tag v<version> && git push origin
+# v<version>`. The verify job refuses a tag that disagrees with Cargo.toml, so `ror --version` names the
+# release it came from.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version from the tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Cargo.toml's version matches the tag
+        shell: bash
+        run: |
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ror") | .version')
+          if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Cargo.toml's version is $cargo_version but the tag is ${{ github.ref_name }}"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      ASSET: ror-v${{ needs.verify.outputs.version }}-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: "1.90.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --profile dist --locked -p ror --target ${{ matrix.target }}
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/dist/ror" .
+          tar -czf "$ASSET.tar.gz" ror LICENSE NOTICE THIRD_PARTY_NOTICES.md
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/dist/ror.exe" .
+          7z a "$ASSET.zip" ror.exe LICENSE NOTICE THIRD_PARTY_NOTICES.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}.*
+          if-no-files-found: error
+
+  release:
+    name: Create the release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List the assets
+        run: ls -l artifacts
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # The fork's -rodeo.N versions are its releases, not previews: the newest stays "Latest"
+          prerelease: false
+          files: artifacts/*
+          fail_on_unmatched_files: true
