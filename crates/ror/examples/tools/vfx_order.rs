@@ -3,6 +3,7 @@
 // moved by ZOffset), largest Size, how far its particles moved since they spawned along the view, on
 // average, and where it falls in ror's order and in the order without that move:
 //   cargo run -p ror --release --example tools -- vfx_order <batch dir> <moment label, e.g. t0.1> [path filter]
+#[cfg(windows)]
 pub fn main() -> anyhow::Result<()> {
 	use anyhow::Context;
 	use ror::render::camera::CameraSpec;
@@ -64,3 +65,6 @@ pub fn main() -> anyhow::Result<()> {
 	}
 	Ok(())
 }
+
+#[cfg(not(windows))]
+pub fn main() {}

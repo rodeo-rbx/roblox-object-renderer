@@ -726,6 +726,8 @@ mod tests {
 		Need { resident: n, commit: n }
 	}
 
+	// Admission reads the machine's memory on Windows only (crate::available_memory): elsewhere every job is admitted
+	#[cfg(windows)]
 	#[test]
 	fn a_job_that_does_not_fit_has_the_caches_relieved_then_queues_until_the_running_ones_end() {
 		let _turn = TURN.lock();
@@ -799,6 +801,8 @@ mod tests {
 		}
 	}
 
+	// Admission reads the machine's memory on Windows only (crate::available_memory): elsewhere every job is admitted
+	#[cfg(windows)]
 	#[test]
 	fn a_job_short_of_memory_tells_its_caller_why_once_and_gives_up_after_the_wait() {
 		let _turn = TURN.lock();
@@ -823,6 +827,8 @@ mod tests {
 		assert_eq!(jobs()["queued"], 0);
 	}
 
+	// Admission reads the machine's memory on Windows only (crate::available_memory): elsewhere every job is admitted
+	#[cfg(windows)]
 	#[test]
 	fn a_job_whose_caller_has_gone_stops_waiting_for_memory() {
 		let _turn = TURN.lock();
