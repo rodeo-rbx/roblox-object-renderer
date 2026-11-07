@@ -17,6 +17,9 @@ serde_json.workspace = true
 ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"] }
 # CDN bodies sometimes arrive gzip-compressed without a Content-Encoding header
 flate2 = "1.1"
+# The cookie of the account signed in to Roblox Studio, the last cookie source (cookie.rs): Windows'
+# Credential Manager, macOS's HTTPStorages cookie file. Without its command line (clap, env_logger).
+rbx_cookie = { version = "0.1.5", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }

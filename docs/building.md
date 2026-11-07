@@ -21,8 +21,9 @@ toolchain is the main platform; macOS builds render through Metal and read built
   `ROR_REE` (its binary, or a checkout built with `cargo build --release`), a checkout at
   `../roblox-engine-emulator` built the same way, or `ree` on the PATH ([scripts.md](scripts.md)).
 - Optional: a Roblox account cookie for assets that need authentication, in this checkout's `.env`
-  (`ROBLOX_ASSET_DELIVERY_COOKIE=...`, ignored by Git) or a file named by `ROR_COOKIE_ENV`. It is
-  only ever sent to assetdelivery.roblox.com ([SECURITY.md](../SECURITY.md)).
+  (`ROBLOX_ASSET_DELIVERY_COOKIE=...`, ignored by Git) or a file named by `ROR_COOKIE_ENV`; without
+  one, ror uses the account signed in to Roblox Studio on this machine (`ROR_STUDIO_COOKIE=0` turns
+  that off). It is only ever sent to assetdelivery.roblox.com ([SECURITY.md](../SECURITY.md)).
 - Optional, for parity work: Roblox Studio running on Windows and a Studio MCP bridge
   ([parity.md](parity.md)).
 

@@ -70,8 +70,9 @@ pub struct AssetConfig {
 	///
 	/// Cookie sources, first match wins: env `ROBLOX_ASSET_DELIVERY_COOKIE`, env `ROBLOSECURITY`,
 	/// then the env files named by `ROR_COOKIE_ENV` and `RUR_COOKIE_ENV`, then `<repo_dir>/.env` (lines
-	/// `ROBLOX_ASSET_DELIVERY_COOKIE=...` or `ROBLOSECURITY=...`). Read lazily, on the first request
-	/// that needs authentication.
+	/// `ROBLOX_ASSET_DELIVERY_COOKIE=...` or `ROBLOSECURITY=...`), then the account signed in to Roblox
+	/// Studio on this machine (unless `ROR_STUDIO_COOKIE=0`). Read lazily, on the first request that
+	/// needs authentication.
 	pub repo_dir: Option<PathBuf>,
 	/// Byte budget of the in-memory cache.
 	pub memory_budget: usize,
@@ -348,12 +349,13 @@ impl Assets {
 		self.cookie().is_some()
 	}
 
-	/// A description of where the cookie comes from (`env ROBLOSECURITY`, `file <path>`), never the
-	/// value itself.
+	/// A description of where the cookie comes from (`env ROBLOSECURITY`, `file <path>`, `studio`),
+	/// never the value itself.
 	pub fn cookie_source(&self) -> Option<String> {
 		self.inner.cookie.get_or_init(|| cookie::load(self.inner.config.repo_dir.as_deref())).as_ref().map(|(_, source)| match source {
 			cookie::CookieSource::Env(name) => format!("env {name}"),
 			cookie::CookieSource::File(path) => format!("file {}", path.display()),
+			cookie::CookieSource::Studio => "studio".to_string(),
 		})
 	}
 
