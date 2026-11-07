@@ -230,12 +230,22 @@ pub fn work_from(directory: &Path) -> std::io::Result<()> {
 	std::env::set_current_dir(&plain).or_else(|_| std::env::set_current_dir(directory))
 }
 
-/// `ROR_STATE_DIR`, else `<checkout>/.cache`.
+/// `ROR_STATE_DIR`, else `<checkout>/.cache`, absolute either way ([`state_dir_from`]).
 pub fn state_dir() -> PathBuf {
-	match std::env::var_os("ROR_STATE_DIR") {
+	state_dir_from(std::env::var_os("ROR_STATE_DIR"), repo_dir)
+}
+
+/// The state dir `given` names, else `<repo>/.cache`; a relative one is made absolute against the
+/// working directory. A service starts in its state dir from its copy in `<state dir>/bin`, and on
+/// macOS and Linux a relative path to that copy is looked up from the state dir itself, so a
+/// relative state dir (`ROR_STATE_DIR=.cache`, or a binary outside any checkout, whose repo_dir is
+/// `.`) failed to start one. An absolute one is kept as it is (Windows' verbatim form included).
+fn state_dir_from(given: Option<std::ffi::OsString>, repo: impl FnOnce() -> PathBuf) -> PathBuf {
+	let dir = match given {
 		Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-		_ => repo_dir().join(".cache"),
-	}
+		_ => repo().join(".cache"),
+	};
+	if dir.is_relative() { std::path::absolute(&dir).unwrap_or(dir) } else { dir }
 }
 
 /// The content store every build, checkout and state dir of the user shares (ror_assets::store):
@@ -317,5 +327,19 @@ mod tests {
 		// a service copy in a state dir outside any checkout has none: serve takes its starter's (--source)
 		assert_eq!(checkout_of(&root.join("state/bin/ror-0.1.0-1-2.exe")), None);
 		std::fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[test]
+	fn a_relative_state_dir_is_made_absolute_against_the_working_directory() {
+		let here = std::env::current_dir().unwrap();
+		// ROR_STATE_DIR=.cache/ror
+		assert_eq!(state_dir_from(Some(".cache/ror".into()), || unreachable!()), here.join(".cache/ror"));
+		// a binary outside any checkout: repo_dir is `.`
+		assert_eq!(state_dir_from(None, || PathBuf::from(".")), here.join("./.cache"));
+		assert_eq!(state_dir_from(Some("".into()), || PathBuf::from(".")), here.join("./.cache"));
+		// an absolute one is kept as it is
+		let absolute = here.join("state");
+		assert_eq!(state_dir_from(Some(absolute.clone().into_os_string()), || unreachable!()), absolute);
+		assert_eq!(state_dir_from(None, || here.clone()), here.join(".cache"));
 	}
 }
