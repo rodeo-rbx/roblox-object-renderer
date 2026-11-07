@@ -24,7 +24,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest]
+        # macOS too (the fork): its renders go through Metal, and the tests on Windows' memory
+        # admission and the capture Studio build on Windows only
+        os: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,8 +38,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The public build: no GPU on GitHub's runners, so ror's render tests run on the software
-      # adapter (WARP); no Studio install or Roblox client cache, so the tests needing them skip.
+      # The public build: no GPU on GitHub's Windows runners, so ror's render tests run on the
+      # software adapter (WARP); no Studio install or Roblox client cache, so the tests needing them skip.
       - name: Build
         run: cargo build --release --locked --workspace --all-targets
       - name: Test the decoding and asset crates
