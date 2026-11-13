@@ -174,6 +174,10 @@ fn runtime_defaults_probe() {
 	}
 	assert_eq!(ror::output::store_dir(), None);
 	assert_eq!(ror::output::asset_config(state, true).repo_dir, None);
+	// A standalone binary also finds ree on the PATH, which a machine with ree installed has: take the
+	// PATH away, so only the bait ree beside the copy could be found.
+	// SAFETY: the probe is the only test in its process (--exact), so nothing reads the environment meanwhile.
+	unsafe { std::env::remove_var("PATH") };
 	assert_eq!(ror::script::locate(), None);
 	assert_eq!(ror::render::rur::locate(), None);
 }
