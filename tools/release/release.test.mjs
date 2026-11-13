@@ -42,7 +42,7 @@ test("version reads every manifest and rejects a mismatching tag or member", (t)
 });
 
 test("repo manifest versions agree", () => {
-	assert.match(version(), /^\d+\.\d+\.\d+$/);
+	assert.match(version(), /^\d+\.\d+\.\d+(-rodeo\.\d+)?$/); // the fork's releases are x.y.z-rodeo.n
 });
 
 test("ZIP preserves order, content, fixed timestamps and Unix permissions", () => {
