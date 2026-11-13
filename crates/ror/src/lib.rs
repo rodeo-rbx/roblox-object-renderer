@@ -23,7 +23,9 @@ pub mod job;
 pub mod lint;
 pub mod lod;
 pub mod mp4;
+pub mod nvenc;
 pub mod output;
+pub(crate) mod par;
 pub mod render;
 pub mod scene;
 pub mod script;
@@ -55,7 +57,7 @@ pub fn worker_threads() -> usize {
 /// Starts rayon's global pool with [`worker_threads`] threads (rayon's own default is one a logical
 /// processor): the first thing a program on this library does, before any parallel work.
 pub fn init_threads() {
-	let _ = rayon::ThreadPoolBuilder::new().num_threads(worker_threads()).build_global();
+	let _ = rayon::ThreadPoolBuilder::new().num_threads(worker_threads()).thread_name(|index| format!("ror-pool-{index}")).build_global();
 }
 
 /// Gives the system back the memory the allocator holds free: mimalloc purges free pages only on

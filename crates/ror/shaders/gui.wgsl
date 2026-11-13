@@ -15,7 +15,8 @@
 // covers; a framed one's as its own camera draws it, the frame's proportions (mode.x 1). The frame's
 // rect in the quad's uv and the image's tint (ImageColor3, its opacity in w: 0 for a GUI that shows no
 // world); a framed one's UIGradient: t = plane.x · x + plane.y · y + plane.z over the frame (x, y its
-// fractions), mode.y colour keypoints (t, r, g, b) and mode.z transparency ones (t, value)
+// fractions), mode.y colour keypoints (t, r, g, b) and mode.z transparency ones (t, value); corner.xy
+// its UICorner's radius in the quad's uv (0: square corners)
 struct GuiWindow {
 	rect: vec4<f32>,
 	tint: vec4<f32>,
@@ -23,6 +24,7 @@ struct GuiWindow {
 	plane: vec4<f32>,
 	colors: array<vec4<f32>, 20>,
 	transparency: array<vec4<f32>, 20>,
+	corner: vec4<f32>,
 }
 @group(2) @binding(0) var window_texture: texture_2d<f32>;
 @group(2) @binding(1) var window_sampler: sampler;
@@ -120,10 +122,22 @@ fn gradient_opacity(t: f32) -> f32 {
 	return 1.0 - select(0.0, value, count > 0u);
 }
 
+// The share of this pixel inside the frame's rounded corners: a UICorner clips the frame's world as it
+// clips its background (anti-aliased over about a pixel); 1 everywhere with square corners.
+fn corner_coverage(uv: vec2<f32>) -> f32 {
+	let radius = max(gui_window.corner.xy, vec2<f32>(1e-6));
+	let centre = (gui_window.rect.xy + gui_window.rect.zw) * 0.5;
+	let half = (gui_window.rect.zw - gui_window.rect.xy) * 0.5;
+	let distance = length(max(abs(uv - centre) - (half - radius), vec2<f32>(0.0)) / radius);
+	let rounded = clamp((1.0 - distance) / max(fwidth(distance), 1e-6) + 0.5, 0.0, 1.0);
+	return select(1.0, rounded, gui_window.corner.x > 0.0 && gui_window.corner.y > 0.0);
+}
+
 // What the GUI draw shows at this pixel (premultiplied display colour, c · a), its image `texel` with
 // the world of its ViewportFrame, if it shows one.
 fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 	var texel = texel_in;
+	let rounded = corner_coverage(input.uv);
 	if (gui_window.mode.x > 0.5) {
 		// A framed ViewportFrame's picture, laid in under what the GUI draws over the frame: this draw
 		// goes over the GUI's image so far, R, and `texel` is what draws over the frame, O, so it blends
@@ -136,7 +150,7 @@ fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 		let inside = all(place >= vec2<f32>(0.0)) && all(place <= vec2<f32>(1.0));
 		let world = textureSampleLevel(window_texture, window_sampler, clamp(place, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
 		let t = dot(gui_window.plane.xy, place) + gui_window.plane.z;
-		let coverage = select(0.0, world.a * gui_window.tint.a * gradient_opacity(t), inside);
+		let coverage = select(0.0, world.a * gui_window.tint.a * gradient_opacity(t) * rounded, inside);
 		let picture = world.rgb * gui_window.tint.rgb * gradient_colour(t) * coverage;
 		return vec4<f32>(texel.rgb * coverage + picture * (1.0 - texel.a), coverage);
 	}
@@ -150,7 +164,7 @@ fn gui_texel(input: GuiOutput, texel_in: vec4<f32>) -> vec4<f32> {
 	let world = textureSampleLevel(window_texture, window_sampler, at, 0.0);
 	let opaque = textureSampleLevel(window_share, window_sampler, at, 0.0).r;
 	let inside = all(input.uv >= gui_window.rect.xy) && all(input.uv <= gui_window.rect.zw);
-	let opacity = select(0.0, gui_window.tint.a, inside);
+	let opacity = select(0.0, gui_window.tint.a * rounded, inside);
 	let coverage = world.a * opacity;
 	let hole = opaque * (1.0 - world.a) * opacity;
 	return vec4<f32>(world.rgb * gui_window.tint.rgb * coverage + texel.rgb * (1.0 - coverage - hole), coverage + texel.a * (1.0 - coverage - hole));

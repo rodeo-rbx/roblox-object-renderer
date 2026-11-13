@@ -473,7 +473,7 @@ fn whole_255ths(emitter: &ParticleEmitter, opacity: f32) -> f32 {
 /// snapshot in any order; one after another, a recorded fight's 368 emitters took 1.6 ms of each
 /// frame's draws). A live scene keeps to its thread, as its parts do (render::each_part).
 pub fn simulate_all(scene: &Scene) -> Vec<Vec<Particle>> {
-	if scene.live || scene.particles.len() < 8 {
+	if scene.live || scene.particles.len() < 8 || !crate::par::spread(scene.particles.len(), crate::par::CLIP_EMITTERS) {
 		scene.particles.iter().map(simulate).collect()
 	} else {
 		use rayon::prelude::*;
@@ -743,7 +743,7 @@ impl super::Renderer {
 			Some(ahead) if ahead.len() == groups.len() => ahead.into_iter().zip(groups).map(|(particles, (_, loaded))| if *loaded { particles } else { Vec::new() }).collect(),
 			_ => {
 				let simulated = |(emitter, (_, loaded)): (&ParticleEmitter, &(Arc<wgpu::BindGroup>, bool))| if *loaded { simulate(emitter) } else { Vec::new() };
-				if scene.live || scene.particles.len() < 8 {
+				if scene.live || scene.particles.len() < 8 || !crate::par::spread(scene.particles.len(), crate::par::CLIP_EMITTERS) {
 					scene.particles.iter().zip(groups).map(simulated).collect()
 				} else {
 					use rayon::prelude::*;

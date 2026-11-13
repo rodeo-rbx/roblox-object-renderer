@@ -1,7 +1,7 @@
 // HDR → display: supersample downscale, exposure, tonemap, colour correction, sRGB encode.
 
 struct ResolveParams {
-	// x exposure multiplier, y tonemapper (0 none, 1 default, 2 retro), z supersample factor, w alpha mode (0 opaque, 1 straight alpha)
+	// x exposure multiplier, y tonemapper (0 none, 1 default, 2 retro), z supersample factor, w alpha mode (0 opaque, 1 straight alpha, 2 a ViewportFrame's target: Background::Frame)
 	params: vec4<f32>,
 	// colour correction: x brightness, y contrast, z saturation, w enabled
 	correction: vec4<f32>,
@@ -102,6 +102,11 @@ fn fs_resolve(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	}
 	if (resolve.rays.y > 0.5 && !(finite(premultiplied) && finite(vec4<f32>(glow, 1.0)) && finite(vec4<f32>(rays, 1.0)))) {
 		return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+	}
+	// A ViewportFrame's target (Background::Frame): its clear colour and what covers it averaged as they
+	// are, the colour clipped at 1 and the alpha the mean opacity
+	if (resolve.params.w > 1.5) {
+		return vec4<f32>(sqrt(tonemap(premultiplied.rgb * premultiplied.rgb * resolve.params.x, resolve.params.y)), saturate(premultiplied.a));
 	}
 	if (resolve.params.w > 0.5) {
 		return transparent(premultiplied, rays, glow);

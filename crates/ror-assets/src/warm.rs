@@ -10,10 +10,9 @@
 //!
 //! [`AssetConfig::max_concurrent_downloads`]: crate::AssetConfig::max_concurrent_downloads
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashSet, VecDeque};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Meta;
@@ -65,6 +64,17 @@ struct Item {
 enum Kind {
 	Plain,
 	Pack(Transcode, u32),
+}
+
+struct Queue {
+	next_chunk: usize,
+	locating: usize,
+	located: VecDeque<(usize, Place)>,
+}
+
+enum Job {
+	Locate(usize),
+	Download((usize, Place)),
 }
 
 /// Where a batch request placed an item.
@@ -209,28 +219,52 @@ impl Assets {
 		use_disk && self.inner.disk.contains(key)
 	}
 
-	/// Locates and downloads `items`: chunks of them, each one batch request then its files, on as
-	/// many threads as downloads may run at once (a chunk's locations are used within seconds).
+	/// Locates and downloads `items` on as many threads as downloads may run at once: each thread
+	/// downloads a located file while there is one waiting, else locates the next chunk with one batch
+	/// request (a chunk's locations are used within seconds), so a chunk's files download side by side.
 	fn fetch_items(&self, items: &[Item], packs: &(dyn Fn(&[u8]) -> u32 + Sync), report: &mut WarmReport) -> Vec<Outcome> {
 		let workers = self.inner.config.max_concurrent_downloads.clamp(1, 64);
 		let chunk = items.len().div_ceil(workers).clamp(8, BATCH);
 		let chunks: Vec<&[Item]> = items.chunks(chunk).collect();
 		let outcomes: Vec<Mutex<Option<Outcome>>> = items.iter().map(|_| Mutex::new(None)).collect();
-		let next = AtomicUsize::new(0);
+		let queue = Mutex::new(Queue { next_chunk: 0, locating: 0, located: VecDeque::new() });
+		let wake = Condvar::new();
 		let totals = Mutex::new(WarmReport::default());
 		std::thread::scope(|scope| {
-			for _ in 0..workers.min(chunks.len()) {
+			for _ in 0..workers.min(items.len()) {
 				scope.spawn(|| {
 					loop {
-						let index = next.fetch_add(1, Ordering::Relaxed);
-						let Some(&chunk_items) = chunks.get(index) else {
-							break;
+						let job = {
+							let mut queue = queue.lock();
+							loop {
+								if let Some(located) = queue.located.pop_front() {
+									break Some(Job::Download(located));
+								}
+								if queue.next_chunk < chunks.len() {
+									queue.next_chunk += 1;
+									queue.locating += 1;
+									break Some(Job::Locate(queue.next_chunk - 1));
+								}
+								if queue.locating == 0 {
+									break None;
+								}
+								wake.wait(&mut queue);
+							}
 						};
-						let places = self.locate(chunk_items);
-						totals.lock().batches += 1;
-						for (offset, (item, place)) in chunk_items.iter().zip(places).enumerate() {
-							let outcome = self.download_item(item, place, packs, &totals);
-							*outcomes[index * chunk + offset].lock() = Some(outcome);
+						match job {
+							Some(Job::Locate(index)) => {
+								let places = self.locate(chunks[index]);
+								totals.lock().batches += 1;
+								let mut queue = queue.lock();
+								queue.locating -= 1;
+								queue.located.extend(places.into_iter().enumerate().map(|(offset, place)| (index * chunk + offset, place)));
+								wake.notify_all();
+							}
+							Some(Job::Download((index, place))) => {
+								let outcome = self.download_item(&items[index], place, packs, &totals);
+								*outcomes[index].lock() = Some(outcome);
+							}
+							None => break,
 						}
 					}
 				});

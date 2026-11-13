@@ -2,8 +2,8 @@
 //! with instead of what it shows. A MeshPart or union is its saved collision data (PhysicalConfigData /
 //! PhysicsData) decoded into its convex hulls, each in its own colour, or its box at Box fidelity; a Part
 //! is its shape (a SpecialMesh changes what a part draws, not what it collides with; a truss collides as
-//! its box). Invisible parts draw too: they often are the collision. Effects, lights in the model and
-//! textures are left out.
+//! its box). Invisible parts draw too: they often are the collision (its scene is extracted keeping
+//! them, `load::Document::keep_invisible`). Effects, lights in the model and textures are left out.
 //!
 //! Decoding the saved data needs a decoder that is not part of this repository: a ror built without it
 //! refuses the view ([`require`]).

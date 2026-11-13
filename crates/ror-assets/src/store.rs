@@ -40,26 +40,67 @@ const TOUCH_AFTER: Duration = Duration::from_secs(3600);
 /// Temporary files left by a process that ended mid-write go after this.
 const STALE_TEMP: Duration = Duration::from_secs(3600);
 
-/// The store's folder: `ROR_STORE` (`0`, `off` or empty: none), else `%LOCALAPPDATA%\ror\store` on
-/// Windows, `$XDG_CACHE_HOME/ror/store` or `~/.cache/ror/store` elsewhere.
+/// The store's folder for a program that links the library (a host): `ROR_STORE` (`0`, `off` or
+/// empty: none), else `%LOCALAPPDATA%\ror\store` on Windows, `$XDG_CACHE_HOME/ror/store` or
+/// `~/.cache/ror/store` elsewhere. ror's own binary uses it too when it runs from a checkout, so a
+/// store that checkout builds already have stays where it is.
 pub fn default_dir() -> Option<PathBuf> {
-	match std::env::var_os("ROR_STORE") {
-		Some(value) => {
-			let text = value.to_string_lossy();
-			if text.trim().is_empty() || matches!(text.trim(), "0" | "off" | "none") {
-				return None;
-			}
-			Some(PathBuf::from(value))
-		}
-		None => {
-			let base = if cfg!(windows) {
-				std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-			} else {
-				std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-			};
-			base.filter(|base| base.is_absolute()).map(|base| base.join("ror").join("store"))
-		}
+	store_in(host_cache_dir)
+}
+
+/// The store's folder for ror's binary outside a checkout: `ROR_STORE` as in [`default_dir`], else
+/// `store/` in [`user_cache_dir`]. Hosts and binaries in a checkout use [`default_dir`] instead.
+pub fn standalone_dir() -> Option<PathBuf> {
+	store_in(user_cache_dir)
+}
+
+/// The per-user cache folder a host has always used. It is [`user_cache_dir`] except on macOS, where
+/// it is `~/.cache/ror` as on Linux, not `~/Library/Caches/ror`.
+fn host_cache_dir() -> Option<PathBuf> {
+	host_cache_dir_for(std::env::consts::OS, |name| std::env::var_os(name).map(PathBuf::from))
+}
+
+/// [`host_cache_dir`] with an explicit operating system and environment for tests.
+fn host_cache_dir_for(os: &str, env: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+	let base = if os == "windows" {
+		env("LOCALAPPDATA")
+	} else {
+		env("XDG_CACHE_HOME").or_else(|| env("HOME").map(|home| home.join(".cache")))
+	};
+	base.filter(|base| base.is_absolute()).map(|base| base.join("ror"))
+}
+
+/// `ROR_STORE` when it is set (no store if it says `0`, `off`, `none` or is empty), else `store/` in
+/// the cache folder that `cache_dir` finds.
+fn store_in(cache_dir: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+	let Some(value) = std::env::var_os("ROR_STORE") else {
+		return cache_dir().map(|cache| cache.join("store"));
+	};
+	let text = value.to_string_lossy();
+	let text = text.trim();
+	if text.is_empty() || matches!(text, "0" | "off" | "none") {
+		return None;
 	}
+	Some(PathBuf::from(value))
+}
+
+/// ror's per-user cache folder, which holds both the content store and a standalone binary's state dir.
+/// `None` when the environment names no absolute home or cache folder.
+pub fn user_cache_dir() -> Option<PathBuf> {
+	cache_dir_for(std::env::consts::OS, |name| std::env::var_os(name).map(PathBuf::from))
+}
+
+/// [`user_cache_dir`] for operating system `os`, reading variables through `env` so a test can
+/// stand in for the environment.
+fn cache_dir_for(os: &str, env: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+	// a relative folder would follow the current directory, so it counts as unset
+	let absolute = |name| env(name).filter(|path| path.is_absolute());
+	let base = match os {
+		"windows" => absolute("LOCALAPPDATA"),
+		"macos" => absolute("HOME").map(|home| home.join("Library/Caches")),
+		_ => absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|home| home.join(".cache"))),
+	};
+	base.map(|base| base.join("ror"))
 }
 
 /// The byte budget (`ROR_STORE_MB`, default 4096).
@@ -230,6 +271,49 @@ pub fn prune(store: &Path, budget: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn standalone_cache_defaults_use_only_absolute_per_user_folders() {
+		let root = std::env::temp_dir().join("ror-cache-defaults");
+		let env = |name: &str| match name {
+			"LOCALAPPDATA" => Some(root.join("local")),
+			"HOME" => Some(root.join("home")),
+			"XDG_CACHE_HOME" => Some(root.join("xdg")),
+			_ => None,
+		};
+		assert_eq!(cache_dir_for("windows", env), Some(root.join("local/ror")));
+		assert_eq!(cache_dir_for("macos", env), Some(root.join("home/Library/Caches/ror")));
+		assert_eq!(cache_dir_for("linux", env), Some(root.join("xdg/ror")));
+		// Linux without XDG_CACHE_HOME falls back to ~/.cache
+		let only_home = |name: &str| (name == "HOME").then(|| root.join("home"));
+		assert_eq!(cache_dir_for("linux", only_home), Some(root.join("home/.cache/ror")));
+		// relative folders are ignored
+		let relative = |_: &str| Some(PathBuf::from("relative"));
+		assert_eq!(cache_dir_for("linux", relative), None);
+	}
+
+	#[test]
+	fn checkout_and_host_stores_keep_the_original_cache_on_every_platform() {
+		let root = std::env::temp_dir().join("ror-store-defaults");
+		let env = |name: &str| match name {
+			"LOCALAPPDATA" => Some(root.join("local")),
+			"HOME" => Some(root.join("home")),
+			"XDG_CACHE_HOME" => Some(root.join("xdg")),
+			_ => None,
+		};
+		let only_home = |name: &str| (name == "HOME").then(|| root.join("home"));
+		let store = |cache: Option<PathBuf>| cache.map(|cache| cache.join("store"));
+
+		assert_eq!(store(host_cache_dir_for("windows", env)), Some(root.join("local/ror/store")));
+		// macOS uses the Linux folders here; only a standalone binary uses ~/Library/Caches
+		for os in ["macos", "linux"] {
+			assert_eq!(store(host_cache_dir_for(os, env)), Some(root.join("xdg/ror/store")));
+			assert_eq!(store(host_cache_dir_for(os, only_home)), Some(root.join("home/.cache/ror/store")));
+		}
+		// A relative XDG_CACHE_HOME has always disabled the host's default store, even with HOME set.
+		let relative_xdg = |name: &str| if name == "XDG_CACHE_HOME" { Some(PathBuf::from("relative")) } else { env(name) };
+		assert_eq!(host_cache_dir_for("macos", relative_xdg), None);
+	}
 
 	#[test]
 	fn the_registry_lists_other_state_dirs_newest_first() {

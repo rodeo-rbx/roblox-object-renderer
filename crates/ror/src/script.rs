@@ -22,8 +22,8 @@ pub fn is_script(input: &str) -> bool {
 
 /// ree's binary, if there is one (the module's doc says where it is looked for).
 pub fn locate() -> Option<PathBuf> {
-	let checkout = std::env::current_exe().ok().and_then(|exe| crate::output::checkout_of(&exe));
-	locate_from(std::env::var_os("ROR_REE"), checkout.as_deref(), std::env::var_os("PATH"))
+	// the checkout ror's binary runs from, none outside one (output::init_binary)
+	locate_from(std::env::var_os("ROR_REE"), crate::output::checkout_dir().as_deref(), std::env::var_os("PATH"))
 }
 
 /// [`locate`] with its inputs given: `ROR_REE`, the checkout ror runs from (none for a binary outside

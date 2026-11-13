@@ -5,8 +5,11 @@ is the command's reference; what draws and the rules each thing follows are in
 [rendering.md](rendering.md), and where content comes from and how it is cached in
 [assets.md](assets.md).
 
+`<state dir>` is the [state folder](building.md#standalone-commands-and-state); a checkout defaults
+to `<checkout>/.cache`.
+
 ```sh
-ror render path/to/Model.rbxm                  # .cache/out/Model/render.png
+ror render path/to/Model.rbxm                  # <state dir>/out/Model/render.png
 ror render Model.rbxm --views front,iso,turntable:8 --size 1024x1024 --out out/model
 ror render 1234567890                          # a model asset id
 ror render ReplicatedStorage.Models.Character --studio "My Place"   # export (read-only), render
@@ -28,7 +31,8 @@ read-only through `SerializationService`, with the place's MaterialVariants; nee
 `{"mode":"lookAt","eye":[0,5,-10],"target":[0,2,0],"fov":40}` or
 `{"mode":"orbit","yaw":25,"pitch":10,"fov":35}` (orbits frame the model's bounds as its parts
 draw; a model drawing no part, an effect whose parts are invisible, by what its effects draw at
-the moment drawn).
+the moment drawn). A JSON list of cameras draws a view each (`camera1`, `camera2`, ...) from one
+load of the input: many candidate cameras of one scene in one command.
 
 - `--focus <instance>` frames what is at or under one instance (a dotted path, or its last names:
   `Head`), the rest drawn around it.
@@ -82,8 +86,9 @@ view's camera and its RenderFidelity, and leaves out the parts the graphics qual
 `--collision [collide|query|touch|all]` draws each part as Roblox's physics sees it
 (`scene/collision.rs`): a MeshPart or union as its saved collision data (its convex hulls, each its
 own colour; Box fidelity a warm grey box), a Part as its shape (a SpecialMesh changes what it draws,
-not what it collides with), invisible parts too, effects and textures left out. The filter keeps the
-parts with CanCollide (the default), CanQuery, CanTouch, or all. Decoding saved collision data needs
+not what it collides with), invisible parts too (a wall at Transparency 1 draws as the same wall
+seen), effects and textures left out. The filter keeps the parts with CanCollide (the default),
+CanQuery, CanTouch, or all, whatever their Transparency. Decoding saved collision data needs
 a decoder that is not part of this repository: a public build refuses the view.
 
 ## Output
@@ -97,6 +102,12 @@ green and blue, low byte first; 0 for none), `parts.json` (each part's path, cla
 transparency, position) and `visible.json` (per view, each part index and the pixels it owns: with
 `--no-png` the only output, for visibility sweeps over thousands of views); a job sets `"ids": true`
 per view.
+
+`--alone <instance>` (with `--ids`; a job's `alone`) says how much of one instance each view shows:
+the view's `alone` in the result holds the pixels its parts own in the view (`shown`) and the pixels
+they own drawn from the same camera with nothing else (`whole`), so `shown / whole` is the share of
+it that nothing hides. Choosing among cameras by what hides a subject takes one command so, where
+drawing the instance by itself in a second job per camera took 20 of them for 10 cameras.
 
 ## Authoring lint
 
@@ -133,13 +144,15 @@ and `<view>.diff.png` (changed pixels in orange over the render in gray). `--jso
   renderer. ror finds rur through `ROR_RUR` (a checkout) or beside this checkout
   (`../roblox-ui-renderer`), and Node through `ROR_NODE` or the PATH; without them GUIs are skipped
   with a warning in the job's `warnings`.
+- A ViewportFrame's world, framed or a window, is clipped to the frame's rect and rounded by its
+  UICorner as rur rounds the frame's background.
 - A view's `guiScale` sets the device pixels per GUI pixel for BillboardGui offsets and text
   (default: the image height / 744, Studio's 1.5 at a 1116 px tall image).
-- GUI images are cached by content in memory and in `.cache/guis` (per rur build); `ROR_NO_GUIS=1`
-  renders without them. ror sends rur its GUI atlases through rur's render service, straight to it
-  once a `rur render` through Node has started it (`ROR_RUR_DIRECT=0`: always through Node), and a
-  video finds its frames' GUI images ahead of their draws, outside the GPU slots: an animated GUI is
-  a new image every frame.
+- GUI images are cached by content in memory and in `<state dir>/guis` (per rur build);
+  `ROR_NO_GUIS=1` renders without them. ror sends rur its GUI atlases through rur's render service,
+  straight to it once a `rur render` through Node has started it (`ROR_RUR_DIRECT=0`: always through
+  Node), and a video finds its frames' GUI images ahead of their draws, outside the GPU slots: an
+  animated GUI is a new image every frame.
 - A SurfaceGui's ViewportFrame whose camera looks through its face (a window, as EgoMoose's
   ViewportWindow builds one: a rift, a portal) shows its world as the view's camera sees it, its
   meshes' vertex alpha cutting holes through the frame's background as in Studio; any other

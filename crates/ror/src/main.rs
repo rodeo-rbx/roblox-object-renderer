@@ -242,7 +242,7 @@ struct CleanArgs {
 	/// (made from their run's studio.png and ror.png; tools/analysis/side_by_side.py draws them again)
 	#[arg(long, value_name = "DAYS")]
 	older_than: Option<f64>,
-	/// Another output folder than this checkout's out/ (another state dir: ROR_STATE_DIR)
+	/// Output folder (default: checkout's out/, or <state dir>/out for a standalone binary)
 	#[arg(long)]
 	out: Option<PathBuf>,
 }
@@ -329,8 +329,9 @@ enum StudioCommand {
 	},
 	/// Capture the capture Studio's viewport to a PNG
 	Capture {
-		#[arg(long, default_value = "out/studio-capture.png")]
-		out: PathBuf,
+		/// Output PNG (default out/studio-capture.png, under the state dir for a standalone binary)
+		#[arg(long)]
+		out: Option<PathBuf>,
 	},
 }
 
@@ -417,7 +418,8 @@ struct RenderArgs {
 	/// Vertical field of view in degrees
 	#[arg(long)]
 	fov: Option<f32>,
-	/// Camera JSON (see CameraSpec), e.g. '{"mode":"lookAt","eye":[0,5,-10],"target":[0,2,0]}'
+	/// Camera JSON (see CameraSpec), e.g. '{"mode":"lookAt","eye":[0,5,-10],"target":[0,2,0]}'; a JSON
+	/// list of them draws a view each (camera1, camera2, ...) from one load
 	#[arg(long)]
 	camera: Option<String>,
 	/// Orbit views frame this box instead of the model: minX,minY,minZ,maxX,maxY,maxZ, or as
@@ -462,6 +464,11 @@ struct RenderArgs {
 	/// material, transparency)
 	#[arg(long)]
 	ids: bool,
+	/// With --ids: how much of this instance (dotted path from the file's root) each view shows: the
+	/// view's `alone` in the result gives its parts' pixels in the view (`shown`) and drawn from the
+	/// same camera with nothing else (`whole`)
+	#[arg(long, value_name = "PATH", requires = "ids")]
+	alone: Option<String>,
 	/// Draw what Roblox draws at a graphics quality level: each MeshPart at the level of detail its
 	/// distance and RenderFidelity give from each view's camera, and none of the parts the quality's
 	/// view distance and size cull leave out: roblox (quality 21) or roblox:<1-21> (notes/cost.md
@@ -542,7 +549,10 @@ impl ScriptArgs {
 fn record_script(input: &str, out: Option<PathBuf>, suffix: &str, seconds: f32, options: &ror::script::Options<'_>) -> Result<(PathBuf, ror::script::Recording)> {
 	let script = std::path::Path::new(input);
 	let name = script.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_else(|| "script".into());
-	let out = out.unwrap_or_else(|| output::state_dir().join("out").join(format!("{name}{suffix}")));
+	let out = match out {
+		Some(out) => out,
+		None => output::state_dir().join("out").join(format!("{name}{suffix}")),
+	};
 	let recording = ror::script::record(script, seconds, options, &out.join("record"))?;
 	for error in &recording.errors {
 		eprintln!("ror: script error: {error}");
@@ -651,6 +661,12 @@ struct VideoArgs {
 	/// named by the extension; repeat for more. The summary's copies say which were written
 	#[arg(long, value_name = "JSON")]
 	copy: Vec<String>,
+	/// Encode the mp4 on the GPU's hardware encoder (NVIDIA's NVENC, in the process) instead of x264:
+	/// constant quality QUALITY (1-51, lower is better), spending at most KBPS kbit/s, so a clip
+	/// of a known length fits a size. The frames cost the CPU no encoding; the clip fails where the
+	/// machine has no such encoder
+	#[arg(long, value_name = "QUALITY[:KBPS]")]
+	nvenc: Option<String>,
 	/// Draw what Roblox draws at a graphics quality level: each MeshPart at the level of detail its
 	/// distance and RenderFidelity give from the camera in each frame, and none of the parts the quality's
 	/// view distance and size cull leave out: roblox (quality 21) or roblox:<1-21> (notes/cost.md
@@ -881,8 +897,8 @@ fn parse_background(value: &str) -> Result<Background> {
 	}
 }
 
-fn assets(offline: bool) -> ror_assets::Assets {
-	ror_assets::Assets::new(output::asset_config(output::state_dir(), offline))
+fn assets(offline: bool) -> Result<ror_assets::Assets> {
+	Ok(ror_assets::Assets::new(output::asset_config(output::state_dir(), offline)))
 }
 
 /// An absolute path string (the render service may run in another working directory).
@@ -932,8 +948,14 @@ fn render(mut args: RenderArgs) -> Result<()> {
 	let (width, height) = parse_size(&args.size)?;
 	let background = parse_background(&args.background)?;
 	let mut views = if let Some(camera) = &args.camera {
-		let camera: CameraSpec = serde_json::from_str(camera).context("--camera JSON")?;
-		vec![job::NamedView { name: "render".into(), view: ror::render::ViewRequest { width, height, camera, background, ..Default::default() } }]
+		// a list of cameras: a view each, camera1 on
+		let named = |name: String, camera: CameraSpec| job::NamedView { name, view: ror::render::ViewRequest { width, height, camera, background, ..Default::default() } };
+		if camera.trim_start().starts_with('[') {
+			let cameras: Vec<CameraSpec> = serde_json::from_str(camera).context("--camera JSON")?;
+			cameras.into_iter().enumerate().map(|(index, camera)| named(format!("camera{}", index + 1), camera)).collect()
+		} else {
+			vec![named("render".into(), serde_json::from_str(camera).context("--camera JSON")?)]
+		}
 	} else if let Some(yaw) = args.yaw {
 		let camera = CameraSpec::Orbit { yaw, pitch: args.pitch, distance: None, padding: 0.08, target: None, fov: args.fov.unwrap_or(70.0) };
 		vec![job::NamedView { name: "render".into(), view: ror::render::ViewRequest { width, height, camera, background, ..Default::default() } }]
@@ -993,12 +1015,13 @@ fn render(mut args: RenderArgs) -> Result<()> {
 		map: map_setting(args.map.as_deref(), args.map_origin.as_deref())?,
 		cost: None,
 		relative_to: std::env::current_dir().ok(),
+		alone: args.alone.filter(|_| args.ids),
 	};
 	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
 		ror::memory_checkpoint("start");
 		let gpu = Arc::new(Gpu::new()?);
 		ror::memory_checkpoint("GPU device");
-		let renderer = Renderer::new(gpu, assets(args.offline))?;
+		let renderer = Renderer::new(gpu, assets(args.offline)?)?;
 		ror::memory_checkpoint("renderer");
 		let value = serde_json::to_value(job::run(&renderer, &SceneCache::default(), &job)?)?;
 		ror::memory_checkpoint("job done");
@@ -1153,10 +1176,11 @@ fn video(mut args: VideoArgs) -> Result<()> {
 			})
 			.collect::<Result<_>>()?,
 		relative_to: std::env::current_dir().ok(),
+		nvenc: args.nvenc.as_deref().map(ror::nvenc::Rate::parse).transpose()?,
 	};
 	let mut result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
 		let gpu = Arc::new(Gpu::new()?);
-		let renderer = Renderer::new(gpu, assets(args.offline))?;
+		let renderer = Renderer::new(gpu, assets(args.offline)?)?;
 		let value = serde_json::to_value(ror::video::run(&renderer, &SceneCache::default(), &job, None)?)?;
 		report_held(&renderer);
 		value
@@ -1288,7 +1312,7 @@ fn studio(command: StudioCommand) -> Result<()> {
 				let experiment = ror::studio::calibrate::experiment(&name)?;
 				let out = output::repo_dir().join("out").join("calibrate").join(&experiment.name);
 				let gpu = Arc::new(Gpu::new()?);
-				let renderer = Renderer::new(gpu, assets(false))?;
+				let renderer = Renderer::new(gpu, assets(false)?)?;
 				ror::studio::calibrate::run(&renderer, experiment, &out)?;
 				println!("{}", out.join("samples.json").display());
 				Ok(())
@@ -1308,6 +1332,7 @@ fn studio(command: StudioCommand) -> Result<()> {
 		StudioCommand::Capture { out } => {
 			#[cfg(windows)]
 			{
+				let out = output::studio_capture_path(out)?;
 				let mut studio = CaptureStudio::connect()?;
 				let (width, height, rgba) = studio.capture_viewport()?;
 				output::write_png(&out, width, height, &rgba, true)?;
@@ -1327,7 +1352,10 @@ fn compare(args: CompareArgs) -> Result<()> {
 	#[cfg(windows)]
 	{
 		let name = args.input.file_stem().map(|stem| stem.to_string_lossy().to_string()).unwrap_or_else(|| "compare".into());
-		let out = args.out.unwrap_or_else(|| output::repo_dir().join("out").join("compare").join(name));
+		let out = match args.out {
+			Some(out) => out,
+			None => output::repo_dir().join("out").join("compare").join(name),
+		};
 		let mut views = match (&args.camera, &args.camera_from) {
 			(Some(camera), _) => {
 				let camera: CameraSpec = serde_json::from_str(camera).context("--camera JSON")?;
@@ -1358,7 +1386,7 @@ fn compare(args: CompareArgs) -> Result<()> {
 			None => None,
 		};
 		let gpu = Arc::new(Gpu::new()?);
-		let renderer = Renderer::new(gpu, assets(args.offline))?;
+		let renderer = Renderer::new(gpu, assets(args.offline)?)?;
 		let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
 		let options = ror::studio::compare::CompareOptions { input: args.input, select: args.select, views, out, environment, lod };
 		let report = ror::studio::compare::run(&renderer, &options)?;
@@ -1556,7 +1584,7 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			ror::scene::load::read_file(&input_path)?
 		} else {
 			let uri = if args.input.chars().all(|c| c.is_ascii_digit()) { format!("rbxassetid://{}", args.input) } else { args.input.clone() };
-			let fetched = assets(args.offline).fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", args.input))?;
+			let fetched = assets(args.offline)?.fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", args.input))?;
 			ror::scene::load::read_bytes(&fetched.bytes)?
 		};
 		if let Some(select) = &args.select {
@@ -1630,7 +1658,10 @@ fn cost(mut args: CostArgs) -> Result<()> {
 	let technology = args.technology.as_deref().map(|name| ["legacy", "voxel", "compatibility", "shadowmap", "future", "unified"].iter().position(|item| *item == name).unwrap_or(5) as u32);
 	let lod = args.lod.as_deref().map(ror::lod::Lod::parse).transpose()?;
 	let playback = playback_args(&TimelineArgs { playback: args.playback.as_deref(), time: args.time, emit: &args.emit, enable: &[], disable: &[], changes: None })?;
-	let out = args.out.clone().unwrap_or_else(|| output::state_dir().join("out").join(format!("{}-cost", job::input_name(&args.input))));
+	let out = match args.out.clone() {
+		Some(out) => out,
+		None => output::state_dir().join("out").join(format!("{}-cost", job::input_name(&args.input))),
+	};
 	let input = if input_path.is_file() { absolute(&input_path) } else { args.input.clone() };
 	let job = Job {
 		input,
@@ -1662,10 +1693,11 @@ fn cost(mut args: CostArgs) -> Result<()> {
 			all_emitters: args.all_emitters,
 		}),
 		relative_to: std::env::current_dir().ok(),
+		alone: None,
 	};
 	let result = if args.no_service || std::env::var_os("ROR_NO_SERVICE").is_some() {
 		let gpu = Arc::new(Gpu::new()?);
-		let renderer = Renderer::new(gpu, assets(args.offline))?;
+		let renderer = Renderer::new(gpu, assets(args.offline)?)?;
 		let value = serde_json::to_value(job::run(&renderer, &SceneCache::default(), &job)?)?;
 		report_held(&renderer);
 		value
@@ -1869,7 +1901,11 @@ fn service(command: ServiceCommand) -> Result<()> {
 
 fn clean(args: CleanArgs) -> Result<()> {
 	use std::path::Path;
-	let (out, state) = (args.out.unwrap_or_else(|| output::repo_dir().join("out")), output::state_dir());
+	let out = match args.out {
+		Some(out) => out,
+		None => output::repo_dir().join("out"),
+	};
+	let state = output::state_dir();
 	let gb = |bytes: u64| bytes as f64 / 1e9;
 	let (freed, skipped) = (if args.dry_run { "to free" } else { "freed" }, |count: usize| if count > 0 { format!(", {count} left as they were") } else { String::new() });
 	if let Some(days) = args.older_than {
@@ -2014,19 +2050,56 @@ fn main() {
 	ror::cap_memory();
 	ror::init_threads();
 	let cli = Cli::parse();
-	let result = match cli.command {
+	let result = run(cli.command);
+	if std::env::var_os("ROR_MEMORY_REPORT").is_some() {
+		memory_report();
+	}
+	if let Err(error) = result {
+		eprintln!("ror: {error:#}");
+		std::process::exit(1);
+	}
+}
+
+/// Whether `command` works only on the paths it was given, so it needs no checkout, state dir or
+/// store. Without a per-user cache folder these commands still run.
+fn uses_no_binary_defaults(command: &Command) -> bool {
+	matches!(command, Command::Inspect(_) | Command::Diff(_) | Command::Studio(StudioCommand::Export { .. }))
+}
+
+/// Chooses this binary's checkout, state dir and store before a command reads them, which is what
+/// separates ror's binary from a host that links the library (`output::init_binary`). Commands that
+/// only use the paths they were given skip it ([`uses_no_binary_defaults`]).
+///
+/// A service runs a copy of ror from its state dir, so it takes the checkout, or the lack of one, of
+/// the ror that started it (`--source`) and the state dir it was given (`--state-dir`). Every other
+/// command goes by its own executable.
+fn select_binary_defaults(command: &Command) -> Result<()> {
+	if uses_no_binary_defaults(command) {
+		return Ok(());
+	}
+	let exe = std::env::current_exe().context("locating the executable")?;
+	match command {
+		Command::Serve(args) => {
+			let starter = args.source.as_deref().map(std::path::Path::new).unwrap_or(&exe);
+			output::init_binary(starter, args.state_dir.clone())
+		}
+		_ => output::init_binary(&exe, None),
+	}
+}
+
+/// Runs one command. `main` prints its error, so a missing state dir ends as an ordinary error message.
+fn run(command: Command) -> Result<()> {
+	select_binary_defaults(&command)?;
+	match command {
 		Command::Render(args) => render(args),
 		Command::Video(args) => video(args),
 		Command::Serve(args) => {
-			// it runs from a copy in its state dir: its checkout (state dir, .env, rur, ree) is its starter's
-			if let Some(checkout) = args.source.as_deref().and_then(|source| output::checkout_of(std::path::Path::new(source))) {
-				output::set_repo_dir(checkout);
-			}
 			if args.gpu_slots.is_some() {
 				eprintln!("ror serve: --gpu-slots does nothing now: draws start within the GPU's free memory, as many at once as fit");
 			}
 			ror::service::serve(ror::service::ServeOptions {
-				state_dir: args.state_dir.unwrap_or_else(output::state_dir),
+				// `--state-dir`, or the default; `select_binary_defaults` has already chosen it
+				state_dir: output::state_dir(),
 				build: args.build,
 				source: args.source,
 				idle: std::time::Duration::from_secs(args.idle),
@@ -2041,13 +2114,6 @@ fn main() {
 		Command::Inspect(args) => inspect(args),
 		Command::Diff(args) => diff(args),
 		Command::Cost(args) => cost(args),
-	};
-	if std::env::var_os("ROR_MEMORY_REPORT").is_some() {
-		memory_report();
-	}
-	if let Err(error) = result {
-		eprintln!("ror: {error:#}");
-		std::process::exit(1);
 	}
 }
 
@@ -2072,5 +2138,25 @@ fn memory_report() {
 		if GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) != 0 {
 			eprintln!("ror memory: peak commit {} MB, peak working set {} MB ({:.0} ms)", counters.PeakPagefileUsage >> 20, counters.PeakWorkingSetSize >> 20, ror::since_first_checkpoint_ms());
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The `--out` that `ror studio capture <args>` parses to.
+	fn capture_out(args: &[&str]) -> Option<PathBuf> {
+		let argv = ["ror", "studio", "capture"].into_iter().chain(args.iter().copied());
+		match Cli::try_parse_from(argv).unwrap().command {
+			Command::Studio(StudioCommand::Capture { out }) => out,
+			_ => panic!("expected studio capture"),
+		}
+	}
+
+	#[test]
+	fn studio_capture_distinguishes_an_omitted_output_from_an_explicit_one() {
+		assert_eq!(capture_out(&[]), None);
+		assert_eq!(capture_out(&["--out", "out/studio-capture.png"]), Some(PathBuf::from("out/studio-capture.png")));
 	}
 }

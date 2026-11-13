@@ -1,6 +1,6 @@
 //! A user-mode sampling profiler for one process (no admin needed for your own processes): every
 //! `interval` ms it reads each thread's CPU time and, for threads that ran since the last round,
-//! suspends them, walks their stack (dbghelp StackWalk64 with the target's PDBs) and credits the CPU
+//! suspends them, walks their stack (dbghelp StackWalk64 with the target's PDBs) and adds the CPU
 //! time used to every function on the stack (inclusive) and to the leaf (exclusive).
 //!   sampler <pid> <seconds> [interval_ms] [top]
 use std::collections::HashMap;

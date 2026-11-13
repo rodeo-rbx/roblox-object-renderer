@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "ror"
-version = "0.1.0-rodeo.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -1613,6 +1613,7 @@ dependencies = [
  "dhat",
  "foldhash 0.2.0",
  "glam",
+ "libloading",
  "libmimalloc-sys",
  "lz4_flex",
  "mimalloc",
@@ -1637,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "ror-assets"
-version = "0.1.0-rodeo.2"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "parking_lot",
@@ -1654,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "ror-image"
-version = "0.1.0-rodeo.2"
+version = "0.3.0"
 dependencies = [
  "bcdec_rs",
  "flate2",
@@ -1666,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "ror-mesh"
-version = "0.1.0-rodeo.2"
+version = "0.3.0"
 dependencies = [
  "draco-core",
  "lz4_flex",
@@ -1724,9 +1725,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",

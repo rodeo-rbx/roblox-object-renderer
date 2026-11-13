@@ -53,6 +53,9 @@ pub struct Viewport {
 	/// Its world as the frame draws it ([`Scene::in_viewport_frame`]: the frame's own light).
 	pub scene: Arc<Scene>,
 	pub kind: ViewportKind,
+	/// Its UICorner's CornerRadius (scale, offset), which rounds its world's corners as it rounds its
+	/// background; `None` without one.
+	pub corner_radius: Option<[f32; 2]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,6 +147,18 @@ impl Viewport {
 	pub fn rect(&self, canvas: [f32; 2]) -> [f32; 4] {
 		let [x, y, width, height] = self.pixels(canvas);
 		[x / canvas[0], y / canvas[1], (x + width) / canvas[0], (y + height) / canvas[1]]
+	}
+
+	/// Its corners' radius in canvas fractions (across, down), as rur rounds the background: the scale of
+	/// the frame's shorter side plus the offset, at most half that side; zero without a UICorner.
+	pub fn corner(&self, canvas: [f32; 2]) -> [f32; 2] {
+		let Some([scale, offset]) = self.corner_radius else {
+			return [0.0, 0.0];
+		};
+		let [_, _, width, height] = self.pixels(canvas);
+		let shortest = width.min(height).max(0.0);
+		let radius = (scale * shortest + offset).clamp(0.0, shortest / 2.0);
+		[radius / canvas[0].max(1e-6), radius / canvas[1].max(1e-6)]
 	}
 }
 
@@ -492,8 +507,9 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 			// background that still hides what is behind it, their decals drawn over it (render::guis)
 			scene.parts.retain(|part| part.transparency < 1.0 || !part.decals.is_empty());
 			let (placement, tint, scene) = (own, [color.x, color.y, color.z, opacity], Arc::new(scene));
+			let corner_radius = corner_radius(document, item);
 			let Some((camera, fov)) = camera else {
-				found.push(Viewport { placement, tint, scene, kind: ViewportKind::Window });
+				found.push(Viewport { placement, tint, scene, kind: ViewportKind::Window, corner_radius });
 				continue;
 			};
 			if scene.parts.is_empty() {
@@ -508,7 +524,7 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 				None => None,
 			};
 			let kind = ViewportKind::Framed(Framed { camera, fov, over: over.map(|(hash, bytes)| (bytes, hash)), gradient: gradient(document, item) });
-			framed.push((child, Viewport { placement, tint, scene, kind }));
+			framed.push((child, Viewport { placement, tint, scene, kind, corner_radius }));
 		}
 	}
 	if !framed.is_empty() {
@@ -517,6 +533,19 @@ fn viewports(document: &Document, gui: Ref, windows: bool, global: bool, warning
 		found.extend(framed.into_iter().map(|(_, viewport)| viewport));
 	}
 	found
+}
+
+/// A ViewportFrame's first UICorner's radius (scale, offset): its TopLeftRadius, which files from a
+/// current engine keep the radius in (rur reads the four corners), else its CornerRadius, else Roblox's
+/// default (0, 8).
+fn corner_radius(document: &Document, frame: &Instance) -> Option<[f32; 2]> {
+	let corner = frame.children().iter().filter_map(|&child| document.dom.get_by_ref(child)).find(|child| child.class == "UICorner")?;
+	// what the file holds (props::udim falls back to the reflection database's default)
+	let held = |name: &str| match corner.properties.get(&rbx_dom_weak::ustr(name)) {
+		Some(rbx_dom_weak::types::Variant::UDim(value)) => Some([value.scale, value.offset as f32]),
+		_ => None,
+	};
+	Some(held("TopLeftRadius").or_else(|| held("CornerRadius")).unwrap_or([0.0, 8.0]))
 }
 
 /// A world-space bounding box's half size and centre of a part.
@@ -831,6 +860,42 @@ mod tests {
 		let over = names(over);
 		assert!(over.iter().any(|(_, name, background)| name == "Backdrop" && *background == Some(1.0)), "{over:?}");
 		assert!(over.iter().any(|(class, name, _)| class == "ImageLabel" && name == "Eye"));
+	}
+
+	#[test]
+	fn a_viewport_frames_ui_corner_rounds_its_world() {
+		let corner = |radius: Option<UDim>, top_left: Option<UDim>| {
+			let mut model = ModelBuilder::new("Rounded");
+			let holder = model.part(&PartSpec { transparency: 1.0, ..Default::default() });
+			let gui = model.child(holder, InstanceBuilder::new("BillboardGui").with_property("Size", UDim2::new(UDim::new(8.0, 0), UDim::new(6.0, 0))));
+			let frame = model.child(
+				gui,
+				InstanceBuilder::new("ViewportFrame")
+					.with_property("Size", UDim2::new(UDim::new(0.5, 0), UDim::new(0.5, 0)))
+					.with_property("CameraCFrame", rbx_dom_weak::types::CFrame::new(Vector3::new(0.0, 0.0, 8.0), rbx_dom_weak::types::Matrix3::identity())),
+			);
+			let mut builder = InstanceBuilder::new("UICorner");
+			if let Some(radius) = radius {
+				builder = builder.with_property("CornerRadius", radius);
+			}
+			if let Some(radius) = top_left {
+				builder = builder.with_property("TopLeftRadius", radius);
+			}
+			model.child(frame, builder);
+			model.child(frame, InstanceBuilder::new("Part").with_property("Size", Vector3::new(2.0, 2.0, 2.0)));
+			extract(model).guis[0].viewports[0].clone()
+		};
+		// rur's radius: the scale of the shorter side plus the offset, at most half that side; 400 x 300
+		// in an 800 x 600 canvas
+		let circle = corner(Some(UDim::new(0.5, 0)), None);
+		assert_eq!(circle.corner_radius, Some([0.5, 0.0]));
+		assert_eq!(circle.corner([800.0, 600.0]), [150.0 / 800.0, 150.0 / 600.0]);
+		assert_eq!(corner(Some(UDim::new(0.1, 20)), None).corner([800.0, 600.0]), [50.0 / 800.0, 50.0 / 600.0]);
+		assert_eq!(corner(Some(UDim::new(1.0, 0)), None).corner([800.0, 600.0]), [150.0 / 800.0, 150.0 / 600.0]);
+		// a UICorner the file leaves at its default: 8 pixels
+		assert_eq!(corner(None, None).corner([800.0, 600.0]), [8.0 / 800.0, 8.0 / 600.0]);
+		// a current engine's file: the radius in the corners, CornerRadius left at its default
+		assert_eq!(corner(Some(UDim::new(0.0, 8)), Some(UDim::new(0.5, 0))).corner_radius, Some([0.5, 0.0]));
 	}
 
 	#[test]

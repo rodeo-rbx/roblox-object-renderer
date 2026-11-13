@@ -31,6 +31,8 @@ parking_lot.workspace = true
 rayon.workspace = true
 
 blake3 = "1.8"
+# NVIDIA's encoder and CUDA libraries, found in the driver when a clip asks for NVENC (src/nvenc.rs)
+libloading = "0.8"
 clap = { version = "4.5.50", features = ["derive"] }
 png = "0.18"
 lz4_flex = { version = "0.13.1", default-features = false, features = ["std"] }

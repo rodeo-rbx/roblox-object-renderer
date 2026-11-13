@@ -394,7 +394,7 @@ pub struct Decal {
 	pub z_index: i32,
 	/// Set for `Texture` (tiled) instances.
 	pub tiling: Option<Tiling>,
-	/// `UVOffset` and `UVScale`: a Decal shows its image at (uv + offset) / scale of the face's own uv
+	/// `UVOffset` and `UVScale`: a Decal shows its image at uv * scale + offset of the face's own uv
 	/// (notes/render.md "Decals").
 	pub uv_offset: [f32; 2],
 	pub uv_scale: [f32; 2],

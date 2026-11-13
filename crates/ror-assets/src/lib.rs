@@ -56,10 +56,11 @@ use http::{Client, Endpoints, Reply};
 pub struct AssetConfig {
 	/// Root of the state dir; downloads go to `<state_dir>/assets`.
 	pub state_dir: PathBuf,
-	/// The Studio install's `content` directory (or its version directory); auto-detected when
-	/// `None`: env `ROR_ROBLOX_CONTENT`, then the registry value
-	/// `HKCU\Software\Roblox\RobloxStudio\ContentFolder`, then the newest
-	/// `%LOCALAPPDATA%\Roblox\Versions\*\RobloxStudioBeta.exe`.
+	/// The `content` directory (or its version directory) of the Roblox install whose built-in files ror
+	/// reads; auto-detected when `None`: env `ROR_ROBLOX_CONTENT`, then the registry value
+	/// `HKCU\Software\Roblox\RobloxStudio\ContentFolder`, then the newest Studio install
+	/// (`%LOCALAPPDATA%\Roblox\Versions\*\RobloxStudioBeta.exe`), else the newest Roblox Player install
+	/// (`RobloxPlayerBeta.exe`), which ships the same files (`studio.rs`).
 	pub studio_content: Option<PathBuf>,
 	/// No network access: only the Studio install, local files and the disk cache.
 	pub offline: bool,
@@ -318,7 +319,7 @@ impl Assets {
 		&self.inner.config
 	}
 
-	/// The detected Studio `content` directory.
+	/// The detected Roblox install's `content` directory (Studio's, else the Player's).
 	pub fn studio_content_dir(&self) -> Option<&Path> {
 		self.studio().map(|s| s.content.as_path())
 	}

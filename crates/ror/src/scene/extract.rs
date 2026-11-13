@@ -301,14 +301,13 @@ fn extract_with(document: &Document, roots: &[Ref], reuse: Option<(&mut RootReus
 		plan.push((index, kept));
 	}
 	// the emitters' reads, most of a walk through an effect, on every core ahead of it
-	let mut emitters: std::collections::HashMap<Ref, (Option<super::particles::ParticleEmitter>, Vec<String>)> = order
-		.par_iter()
-		.filter_map(|&referent| {
-			let instance = document.dom.get_by_ref(referent).filter(|instance| instance.class == "ParticleEmitter")?;
-			let mut warnings = Vec::new();
-			Some((referent, (super::particles::read(document, referent, instance, &mut warnings), warnings)))
-		})
-		.collect();
+	let read = |&referent: &Ref| {
+		let instance = document.dom.get_by_ref(referent).filter(|instance| instance.class == "ParticleEmitter")?;
+		let mut warnings = Vec::new();
+		Some((referent, (super::particles::read(document, referent, instance, &mut warnings), warnings)))
+	};
+	let mut emitters: std::collections::HashMap<Ref, (Option<super::particles::ParticleEmitter>, Vec<String>)> =
+		if crate::par::spread(order.len(), 4096) { order.par_iter().filter_map(read).collect() } else { order.iter().filter_map(read).collect() };
 	scene.particles.reserve_exact(emitters.len());
 	let mut spans = spans.into_iter().peekable();
 	// the kept pieces' parts' indices, wanted only by Highlights (finish_walk): a map's thousands of
@@ -477,7 +476,8 @@ fn finish_walk(document: &Document, scene: &mut Scene, mut part_indices: std::co
 	for (path, referent) in effects.chain(scene.beams.iter().map(|beam| (&beam.path, beam.referent))).chain(scene.trails.iter().map(|trail| (&trail.path, trail.referent))) {
 		named.entry(path.clone()).or_insert(referent);
 	}
-	scene.lineage = named.into_par_iter().map(|(path, referent)| (path, document.lineage(referent))).collect();
+	let lineage = |(path, referent): (String, Ref)| (path, document.lineage(referent));
+	scene.lineage = if crate::par::spread(named.len(), 1024) { named.into_par_iter().map(lineage).collect() } else { named.into_iter().map(lineage).collect() };
 }
 
 /// The instances at or under `roots` in the order a walk through them meets them: depth first, each
@@ -599,7 +599,7 @@ pub(super) fn current_seed(instance: &Instance) -> Option<u64> {
 }
 
 /// Adds a part to the scene; returns it instead when it is an invisible Glass part (only a Highlight
-/// draws it).
+/// draws it) and the document does not keep invisible parts ([`Document::keep_invisible`]).
 fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeletons: &mut Skeletons, characters: &mut Characters, scene: &mut Scene) -> Option<Part> {
 	let path = document.path_of(referent);
 	let Some(cframe) = props::cframe(instance, "CFrame") else {
@@ -785,7 +785,7 @@ fn extract_part(document: &Document, referent: Ref, instance: &Instance, skeleto
 	}
 
 	let visible = part.transparency < 1.0 || !part.decals.is_empty();
-	if visible {
+	if visible || document.keep_invisible {
 		scene.parts.push(Arc::new(part));
 		return None;
 	}
@@ -816,12 +816,7 @@ pub fn environment(document: &Document) -> Option<Environment> {
 	let lighting = document.lighting.and_then(|lighting| document.dom.get_by_ref(lighting))?;
 	let mut environment = Environment::from_lighting(&document.dom, lighting);
 	// the Terrain's Clouds belong to the place's look too
-	let dom = &document.dom;
-	let child = |parent: &Instance, class: &str| parent.children().iter().filter_map(|&child| dom.get_by_ref(child)).find(|child| child.class == class);
-	environment.clouds = child(dom.root(), "Workspace")
-		.and_then(|workspace| child(workspace, "Terrain"))
-		.and_then(|terrain| child(terrain, "Clouds"))
-		.and_then(crate::scene::environment::Clouds::read);
+	environment.clouds = document.clouds().and_then(|clouds| document.dom.get_by_ref(clouds)).and_then(crate::scene::environment::Clouds::read);
 	Some(environment)
 }
 

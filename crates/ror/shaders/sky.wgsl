@@ -5,7 +5,8 @@
 @group(0) @binding(2) var sky_sampler: sampler;
 
 struct SkyParams {
-	// x radiance multiplier, y draw sky (1) or transparent background (0)
+	// x radiance multiplier, y draw sky (1) or transparent background (0), z 1 when the background is a
+	// ViewportFrame's clear colour, written as it is (not premultiplied: Background::Frame)
 	params: vec4<f32>,
 	// background colour when the sky is off
 	background: vec4<f32>,
@@ -184,6 +185,9 @@ fn skybox(direction: vec3<f32>, ddx: vec3<f32>, ddy: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_sky(input: FullscreenOutput) -> @location(0) vec4<f32> {
 	// the scene target holds √x (mesh.wgsl)
+	if (sky.params.z > 0.5) {
+		return vec4<f32>(sqrt(sky.background.rgb), sky.background.a);
+	}
 	if (sky.params.y < 0.5) {
 		return vec4<f32>(sqrt(sky.background.rgb) * sky.background.a, sky.background.a);
 	}

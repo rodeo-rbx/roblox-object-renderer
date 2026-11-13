@@ -7,7 +7,7 @@ Using ror:
 
 | page | what it covers |
 |---|---|
-| [building.md](building.md) | requirements, building, Cargo features and the x264 encoder |
+| [building.md](building.md) | release installs, verification, state paths, building, Cargo features and the x264 encoder |
 | [render.md](render.md) | `ror render`: inputs, cameras, levels of detail, maps, the collision view, output, lints, inspect and diff, GUIs |
 | [playback.md](playback.md) | effects over time: the playback flags and JSON, emit modes, the Lighting while an effect plays |
 | [video.md](video.md) | `ror video`: cameras, formats, encoders, the x264 feature, the contact sheet, copies, summary metrics and lints |

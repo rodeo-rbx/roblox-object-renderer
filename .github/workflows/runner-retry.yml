@@ -1,0 +1,58 @@
+# Re-runs the jobs of a CI or Release run that failed only because GitHub never gave them a runner.
+#
+# GitHub's hosted macOS arm64 runners run short at times. A job for one then waits with the notice "Due to capacity
+# constraints, jobs targeting macOS arm64 runners may experience longer queue times", and 15 minutes after it was
+# created GitHub cancels it with "The job was not acquired by Runner of type hosted even after multiple attempts",
+# whatever its timeout-minutes: the run fails though nothing in it failed. When every job of a failed run that did not
+# pass is such a job (the jobs that waited on them are skipped), this re-runs the run's failed jobs, which also starts
+# the skipped ones after them. It does so up to the run's third attempt, and never for a run that a newer run of the
+# same workflow, branch and event has replaced. A run with any other failure is left as it is.
+#
+# It runs no repository code, only GitHub's API through gh. It reads the default branch's copy of this file.
+name: Runner retry
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  retry:
+    if: ${{ !github.event.repository.private && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt < 3 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write # re-run the jobs
+      checks: read # read why a job ended
+    steps:
+      - name: Re-run the jobs no runner took
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          CREATED: ${{ github.event.workflow_run.created_at }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          # The jobs of the attempt that failed that neither passed nor were skipped
+          gh api "repos/$repo/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | [.id, (.runner_id // 0), (.steps | length), .name] | @tsv' > failed.tsv
+          if [ ! -s failed.tsv ]; then echo "No failed job in attempt $ATTEMPT of run $RUN_ID"; exit 0; fi
+          while IFS=$'\t' read -r job runner steps name; do
+            # A job that a runner took, or that ran a step, failed for itself
+            if [ "$runner" != 0 ] || [ "$steps" != 0 ]; then echo "Not re-run: $name ran on a runner and failed"; exit 0; fi
+            if ! gh api "repos/$repo/check-runs/$job/annotations" --jq '.[].message' | grep -q 'was not acquired by Runner'; then
+              echo "Not re-run: $name ended without a runner for another reason"; exit 0
+            fi
+            echo "$name: no runner took it"
+          done < failed.tsv
+          newer=$(gh api "repos/$repo/actions/workflows/$WORKFLOW_ID/runs?branch=$BRANCH&event=$EVENT&per_page=20" \
+            --jq "[.workflow_runs[] | select(.id != $RUN_ID and .created_at > \"$CREATED\")] | length")
+          if [ "$newer" != 0 ]; then echo "Not re-run: a newer run of this workflow on $BRANCH replaced run $RUN_ID"; exit 0; fi
+          gh run rerun "$RUN_ID" --failed -R "$repo"
+          echo "Re-ran the failed jobs of run $RUN_ID (attempt $ATTEMPT failed for want of a runner)" | tee -a "$GITHUB_STEP_SUMMARY"

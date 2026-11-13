@@ -191,22 +191,94 @@ fn decode_png_from(reader: impl std::io::BufRead + std::io::Seek) -> Result<(u32
 	Ok((info.width, info.height, rgba))
 }
 
-/// The checkout this binary runs from (its `.env`, default state dir, rur and ree beside it): a service's starter's, else the executable's.
+/// The folder that holds the default `out/` and, for a host, the `.cache` state dir. For a host (a
+/// program that links this library): what [`set_repo_dir`] set, else the nearest folder above the
+/// executable that holds a `Cargo.lock` ([`checkout_of`]), else `.`. ror's own binary replaces this at
+/// startup ([`init_binary`]) with its checkout, or with its state dir when it runs from none.
 pub fn repo_dir() -> PathBuf {
 	REPO_DIR.get_or_init(|| std::env::current_exe().ok().and_then(|exe| checkout_of(&exe)).unwrap_or_else(|| PathBuf::from("."))).clone()
 }
 
-/// The checkout an executable belongs to: the nearest folder above it holding a `Cargo.lock`, canonical.
-pub fn checkout_of(exe: &Path) -> Option<PathBuf> {
-	exe.ancestors().skip(1).find(|dir| dir.join("Cargo.lock").is_file())?.canonicalize().ok()
+/// Where `ror studio capture` writes: the explicit `--out`, else `out/studio-capture.png`, relative to
+/// the working directory in a checkout (as it always was) or under the state dir for a standalone
+/// binary, whose working directory is not ours to write into.
+pub fn studio_capture_path(out: Option<PathBuf>) -> Result<PathBuf> {
+	let default = Path::new("out/studio-capture.png");
+	match out {
+		Some(out) => Ok(out),
+		None if checkout_dir().is_some() => Ok(default.to_path_buf()),
+		None => Ok(repo_dir().join(default)),
+	}
 }
 
-/// Sets [`repo_dir`] for the rest of this process, before anything reads it (a service: its starter's checkout).
+/// The checkout whose `.env`, rur and ree this process may use. A host always has one ([`repo_dir`]).
+/// ror's own binary has one only when it runs from a ror checkout: `None` for a standalone binary,
+/// which must not look in the working folder or beside itself.
+pub fn checkout_dir() -> Option<PathBuf> {
+	BINARY_CHECKOUT.get().cloned().unwrap_or_else(|| Some(repo_dir()))
+}
+
+/// For hosts: the checkout an executable belongs to, the nearest folder above it holding a
+/// `Cargo.lock`. Any Cargo project counts, as a host is usually not ror's own checkout.
+pub fn checkout_of(exe: &Path) -> Option<PathBuf> {
+	nearest_checkout(exe, |dir| dir.join("Cargo.lock").is_file())
+}
+
+/// For ror's binary: the ror checkout an executable belongs to, the nearest folder above it holding
+/// a `Cargo.lock` and `crates/ror/Cargo.toml`. Another Cargo project above a released binary is not
+/// its checkout.
+pub fn ror_checkout_of(exe: &Path) -> Option<PathBuf> {
+	nearest_checkout(exe, |dir| dir.join("Cargo.lock").is_file() && dir.join("crates/ror/Cargo.toml").is_file())
+}
+
+/// The nearest folder above `exe` (not `exe` itself) that `is_checkout` accepts, canonical.
+fn nearest_checkout(exe: &Path, is_checkout: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+	exe.ancestors().skip(1).find(|dir| is_checkout(dir))?.canonicalize().ok()
+}
+
+/// For hosts: sets [`repo_dir`] before anything reads it, such as a service's starter's checkout. It
+/// does nothing once `repo_dir` has been read or set.
 pub fn set_repo_dir(dir: PathBuf) {
 	let _ = REPO_DIR.set(dir);
 }
 
+/// For ror's binary: chooses its folders before anything reads them. A host never calls this and
+/// keeps the defaults of [`repo_dir`] and [`state_dir`].
+///
+/// `source` is the executable whose checkout counts: the binary itself, or for a service (which runs
+/// a copy from its state dir) the ror that started it. `state` is `serve --state-dir`. The state dir
+/// is that, else `ROR_STATE_DIR`, else `.cache` in the checkout, else `state/` in the per-user
+/// cache, so a standalone binary never writes beside itself or into the working folder.
+///
+/// The only fallible step, finding the per-user cache, happens here so that the path getters stay
+/// infallible. It must run first: it does nothing for what was already read or set.
+pub fn init_binary(source: &Path, state: Option<PathBuf>) -> Result<()> {
+	let checkout = ror_checkout_of(source);
+	let state = binary_state_dir(checkout.as_deref(), state)?;
+	// without a checkout, the state dir also holds the default `out/`
+	let repo = checkout.clone().unwrap_or_else(|| state.clone());
+	set_repo_dir(repo);
+	set_state_dir(state);
+	let _ = BINARY_CHECKOUT.set(checkout);
+	Ok(())
+}
+
+/// The absolute state dir of ror's binary: `requested`, else `ROR_STATE_DIR`, else `.cache` in
+/// `checkout`, else `state/` in the per-user cache.
+fn binary_state_dir(checkout: Option<&Path>, requested: Option<PathBuf>) -> Result<PathBuf> {
+	let state = match (requested.or_else(state_dir_from_env), checkout) {
+		(Some(state), _) => state,
+		(None, Some(checkout)) => checkout.join(".cache"),
+		(None, None) => ror_assets::store::user_cache_dir().context("no per-user cache directory; set ROR_STATE_DIR")?.join("state"),
+	};
+	std::path::absolute(state).context("resolving the state dir")
+}
+
+/// What [`repo_dir`] returns, once set or first read.
 static REPO_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// Set by [`init_binary`] and by nothing else: ror's own checkout, `None` for a standalone binary.
+/// Unset in a host.
+static BINARY_CHECKOUT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// A path without Windows' verbatim prefix (`\\?\C:\...`, what canonicalize returns), `..`
 /// resolved; a verbatim UNC path (`\\?\UNC\...`) stays as it is.
@@ -230,32 +302,54 @@ pub fn work_from(directory: &Path) -> std::io::Result<()> {
 	std::env::set_current_dir(&plain).or_else(|_| std::env::set_current_dir(directory))
 }
 
-/// `ROR_STATE_DIR`, else `<checkout>/.cache`, absolute either way ([`state_dir_from`]).
+/// Where this process keeps its state: what [`set_state_dir`] fixed (ror's binary does at startup, in
+/// [`init_binary`]), else `ROR_STATE_DIR`, else `.cache` in a host's [`repo_dir`].
 pub fn state_dir() -> PathBuf {
-	state_dir_from(std::env::var_os("ROR_STATE_DIR"), repo_dir)
+	if let Some(dir) = STATE_DIR.get() {
+		return dir.clone();
+	}
+	state_dir_from_env().unwrap_or_else(|| repo_dir().join(".cache"))
 }
 
-/// The state dir `given` names, else `<repo>/.cache`; a relative one is made absolute against the
-/// working directory. A service starts in its state dir from its copy in `<state dir>/bin`, and on
-/// macOS and Linux a relative path to that copy is looked up from the state dir itself, so a
-/// relative state dir (`ROR_STATE_DIR=.cache`, or a binary outside any checkout, whose repo_dir is
-/// `.`) failed to start one. An absolute one is kept as it is (Windows' verbatim form included).
-fn state_dir_from(given: Option<std::ffi::OsString>, repo: impl FnOnce() -> PathBuf) -> PathBuf {
-	let dir = match given {
-		Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-		_ => repo().join(".cache"),
-	};
-	if dir.is_relative() { std::path::absolute(&dir).unwrap_or(dir) } else { dir }
+/// `ROR_STATE_DIR`, unless it is unset or empty.
+fn state_dir_from_env() -> Option<PathBuf> {
+	std::env::var_os("ROR_STATE_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
 }
+
+/// Fixes the state dir for the rest of this process, so a service's pipeline, texture and GUI caches
+/// follow its `--state-dir` and not the environment. It does nothing once the state dir has been set.
+pub fn set_state_dir(dir: PathBuf) {
+	let _ = STATE_DIR.set(dir);
+}
+
+static STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The content store every build, checkout and state dir of the user shares (ror_assets::store):
-/// `ROR_STORE` (`0`: none), else `%LOCALAPPDATA%\ror\store`; none in unit tests.
+/// `ROR_STORE` (`0`: none), else `store/` in the per-user cache; none in unit tests. ror's binary
+/// uses `ror_assets::store::standalone_dir` outside a checkout, else `default_dir` as a host does.
+/// They differ in where macOS keeps the cache. The first call decides, so ror's binary calls
+/// [`init_binary`] before it.
 pub fn store_dir() -> Option<PathBuf> {
 	if cfg!(test) {
 		return None;
 	}
 	static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-	DIR.get_or_init(ror_assets::store::default_dir).clone()
+	DIR.get_or_init(|| {
+		let host = ror_assets::store::default_dir;
+		let standalone = ror_assets::store::standalone_dir;
+		default_store(BINARY_CHECKOUT.get(), host, standalone)
+	})
+	.clone()
+}
+
+/// Picks the store folder from what [`init_binary`] decided. `checkout` is `None` when it never ran
+/// (a host), `Some(None)` for a standalone binary and `Some(Some(_))` for a binary in a checkout.
+/// Only a standalone binary takes the new per-user folder; the others keep the store they have.
+fn default_store(checkout: Option<&Option<PathBuf>>, host: impl FnOnce() -> Option<PathBuf>, standalone: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+	match checkout {
+		Some(None) => standalone(),
+		Some(Some(_)) | None => host(),
+	}
 }
 
 /// The other state dirs that used the content store (`ror_assets::store::state_dirs`), looked in for
@@ -268,7 +362,7 @@ pub fn other_state_dirs() -> &'static [PathBuf] {
 /// The asset resolver's settings for `state_dir`: its downloads shared with `ROR_SHARED_STATE_DIRS`'
 /// and the content store's.
 pub fn asset_config(state_dir: PathBuf, offline: bool) -> ror_assets::AssetConfig {
-	ror_assets::AssetConfig { offline, repo_dir: Some(repo_dir()), shared: shared_state_dirs(), store: store_dir(), ..ror_assets::AssetConfig::new(state_dir) }
+	ror_assets::AssetConfig { offline, repo_dir: checkout_dir(), shared: shared_state_dirs(), store: store_dir(), ..ror_assets::AssetConfig::new(state_dir) }
 }
 
 /// A state dir's file `name` (what one learnt about this machine: the GPU its services start on, its
@@ -306,6 +400,30 @@ pub fn shared_state_dirs() -> Vec<PathBuf> {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn only_a_binary_without_a_checkout_uses_the_standalone_store() {
+		// Distinct cache folders, as on macOS, even when this test runs on another platform.
+		let root = std::env::temp_dir().join("ror-store-selection");
+		let host = || Some(root.join("home/.cache/ror/store"));
+		let standalone = || Some(root.join("home/Library/Caches/ror/store"));
+		let in_checkout = Some(root.join("checkout"));
+		// init_binary never ran: a host
+		assert_eq!(default_store(None, host, standalone), host());
+		assert_eq!(default_store(Some(&in_checkout), host, standalone), host());
+		assert_eq!(default_store(Some(&None), host, standalone), standalone());
+	}
+
+	#[test]
+	fn studio_capture_keeps_the_checkout_default_and_explicit_paths() {
+		// The unit tests run from a checkout; tests/standalone.rs covers the standalone default.
+		assert!(checkout_dir().is_some());
+		let default = PathBuf::from("out/studio-capture.png");
+		assert_eq!(studio_capture_path(None).unwrap(), default);
+		for explicit in [default, std::env::temp_dir().join("capture.png")] {
+			assert_eq!(studio_capture_path(Some(explicit.clone())).unwrap(), explicit);
+		}
+	}
+
 	#[cfg(windows)]
 	#[test]
 	fn plain_paths_drop_the_verbatim_prefix_but_not_unc() {
@@ -321,25 +439,16 @@ mod tests {
 		std::fs::create_dir_all(&repo).unwrap();
 		std::fs::write(repo.join("Cargo.lock"), "").unwrap();
 		let canonical = repo.canonicalize().unwrap();
+		assert_eq!(checkout_of(&repo.join("target/release/host.exe")), Some(canonical.clone()));
+		assert_eq!(ror_checkout_of(&repo.join("target/release/ror.exe")), None);
+		std::fs::create_dir_all(repo.join("crates/ror")).unwrap();
+		std::fs::write(repo.join("crates/ror/Cargo.toml"), "").unwrap();
 		for exe in ["target/release/ror.exe", "target/release/deps/ror-0a1b.exe", "target-dist/release/ror.exe", ".cache/bin/ror-0.1.0-1-2.exe"] {
 			assert_eq!(checkout_of(&repo.join(exe)), Some(canonical.clone()), "{exe}");
+			assert_eq!(ror_checkout_of(&repo.join(exe)), Some(canonical.clone()), "{exe}");
 		}
 		// a service copy in a state dir outside any checkout has none: serve takes its starter's (--source)
 		assert_eq!(checkout_of(&root.join("state/bin/ror-0.1.0-1-2.exe")), None);
 		std::fs::remove_dir_all(&root).unwrap();
-	}
-
-	#[test]
-	fn a_relative_state_dir_is_made_absolute_against_the_working_directory() {
-		let here = std::env::current_dir().unwrap();
-		// ROR_STATE_DIR=.cache/ror
-		assert_eq!(state_dir_from(Some(".cache/ror".into()), || unreachable!()), here.join(".cache/ror"));
-		// a binary outside any checkout: repo_dir is `.`
-		assert_eq!(state_dir_from(None, || PathBuf::from(".")), here.join("./.cache"));
-		assert_eq!(state_dir_from(Some("".into()), || PathBuf::from(".")), here.join("./.cache"));
-		// an absolute one is kept as it is
-		let absolute = here.join("state");
-		assert_eq!(state_dir_from(Some(absolute.clone().into_os_string()), || unreachable!()), absolute);
-		assert_eq!(state_dir_from(None, || here.clone()), here.join(".cache"));
 	}
 }

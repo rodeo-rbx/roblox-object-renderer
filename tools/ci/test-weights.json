@@ -1,0 +1,20 @@
+{
+	"about": "Seconds each slow test of ror's library takes in CI (one test thread, GitHub's Windows runner, the software adapter): the median of public CI runs 43139924994, 43309276587 and 43322564574. tools/ci/test-shard.mjs deals the tests out to the CI jobs by these times; a test not listed counts as 25 ms. A missing or stale time never drops a test, it only makes the jobs less even. To refresh: take the times between consecutive 'test <name> ... ok' lines of the jobs' logs (gh run view <id> --log), and list every test over 2 s.",
+	"seconds": {
+		"render::ao::tests::a_clip_s_kept_occlusion_is_its_frames_drawn_whole": 98,
+		"render::residency::tests::a_clip_skips_the_feedback_for_what_it_saw_and_reads_the_rest_whole": 96,
+		"video::tests::a_still_frame_is_the_one_before_again_and_a_changing_one_is_drawn": 87,
+		"render::prepared::clip_tests::a_clip_frame_from_the_last_one_draws_as_it_alone": 63,
+		"video::tests::a_sheet_first_clip_answers_with_its_sheet_and_draws_the_same_files": 60,
+		"render::post::tests::what_blends_takes_the_far_blur_of_its_own_depth": 52,
+		"job::tests::alone_counts_what_hides_an_instance_in_each_view": 50,
+		"render::gate_tests::relieving_keeps_the_targets_a_draw_holds_and_changes_no_pixel": 49,
+		"render::residency::tests::maps_held_from_a_coarser_level_draw_as_whole_ones": 48,
+		"job::tests::a_jobs_relative_local_paths_are_read_from_its_folder": 46,
+		"render::decal_uv_tests::a_decals_uv_offset_and_scale_map_the_face_to_its_image": 45,
+		"render::gate_tests::a_draw_takes_no_more_than_its_targets_estimate_and_the_gate_changes_no_pixel": 45,
+		"render::sky_tests::frames_whose_skybox_fails_share_the_gradient_sky": 44,
+		"render::viewport_frame_tests::a_viewport_frames_target_is_cleared_to_its_background": 29,
+		"service::tests::an_unanswered_request_says_how": 2
+	}
+}

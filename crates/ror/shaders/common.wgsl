@@ -287,7 +287,7 @@ const TEX_DECAL_FACE_ONLY: u32 = 4194304u;
 const TEX_VERTEX_ALPHA: u32 = 8388608u;
 // a decal on a posed skinned mesh: projected from the bind pose (`vs_decal_bind`)
 const TEX_DECAL_BIND: u32 = 16777216u;
-// a Decal's UVOffset / UVScale (in `tiling`: scale, offset): its image at (uv + offset) / scale
+// a Decal's UVOffset / UVScale (in `tiling`: scale, offset): its image at uv * scale + offset
 const TEX_DECAL_UV: u32 = 33554432u;
 // a MeshPart's decal: on the faces whose normal's dominant axis in the part is its face's
 const TEX_DECAL_DOMINANT: u32 = 67108864u;

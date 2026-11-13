@@ -35,13 +35,17 @@ pub struct Document {
 	/// The folder its content's relative local paths are read from ([`Document::read_relative_to`]);
 	/// `None`: the process's working directory.
 	pub relative_to: Option<PathBuf>,
+	/// Drawn as the collisions-only view ([`super::collision`]): its scene keeps the parts that draw
+	/// nothing (Transparency 1 or more, no decals) among its parts, since they often are the collision.
+	pub keep_invisible: bool,
 }
 
-/// A place's Lighting and what is in it, copied out of the place to give to the models a playback
-/// changes it for ([`Document::give_lighting`]).
+/// A place's Lighting and what is in it, and its Terrain's Clouds, copied out of the place to give to
+/// the models a playback changes them for ([`Document::give_lighting`]).
 pub struct LightingCopy {
 	dom: WeakDom,
 	lighting: Ref,
+	clouds: Option<Ref>,
 }
 
 impl LightingCopy {
@@ -50,8 +54,20 @@ impl LightingCopy {
 		let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
 		let copy = document.dom.clone_into_external(lighting, &mut dom);
 		dom.transfer_within(copy, dom.root_ref());
-		Some(Self { dom, lighting: copy })
+		let clouds = document.clouds().map(|clouds| document.dom.clone_into_external(clouds, &mut dom));
+		if let Some(clouds) = clouds {
+			dom.transfer_within(clouds, dom.root_ref());
+		}
+		Some(Self { dom, lighting: copy, clouds })
 	}
+}
+
+/// Where a playback finds the Terrain's Clouds: their path in a place (a recording's target).
+pub const CLOUDS_PATH: [&str; 3] = ["Workspace", "Terrain", "Clouds"];
+
+/// The first child of `parent` of class `class`.
+fn child_of_class(dom: &WeakDom, parent: Ref, class: &str) -> Option<Ref> {
+	dom.get_by_ref(parent)?.children().iter().copied().find(|&child| dom.get_by_ref(child).is_some_and(|instance| instance.class == class))
 }
 
 pub fn read_file(path: &Path) -> Result<Document> {
@@ -270,7 +286,7 @@ impl Document {
 				.unwrap_or_default(),
 			None => root.children().to_vec(),
 		};
-		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None }
+		Self { dom, salt: String::new(), is_place, roots, lighting, material_service, setting: None, seeds: HashMap::new(), play: false, relative_to: None, keep_invisible: false }
 	}
 
 	/// Reads its content's relative local paths from `folder` (a job's caller's working directory: a
@@ -377,12 +393,15 @@ impl Document {
 				queue.extend(instance.children().iter().copied());
 			}
 		}
-		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone() }
+		Document { dom, salt: self.salt.clone(), is_place: self.is_place, roots: self.roots.clone(), lighting: self.lighting, material_service: self.material_service, setting: self.setting.clone(), seeds: self.seeds.clone(), play: self.play, relative_to: self.relative_to.clone(), keep_invisible: self.keep_invisible }
 	}
 
 	/// Gives the document a Lighting for a playback to change, in place of its own: a copy of
 	/// `place`'s (a model drawn in that place's light, `--lighting-from`), else, when it has none, one
-	/// holding ror's default environment, the light a model is drawn in. It is not drawn.
+	/// holding ror's default environment, the light a model is drawn in. It is not drawn. The Terrain's
+	/// Clouds go with it, at [`CLOUDS_PATH`]: a copy of `place`'s, else the document's own, and a
+	/// disabled Clouds (no clouds, as ror's default environment and a place without any draw) when there
+	/// are none.
 	pub fn give_lighting(&mut self, place: Option<&LightingCopy>) {
 		let lighting = match place {
 			Some(place) => {
@@ -392,15 +411,63 @@ impl Document {
 				}
 				let copy = place.dom.clone_into_external(place.lighting, &mut self.dom);
 				self.dom.transfer_within(copy, self.dom.root_ref());
-				copy
+				Some(copy)
 			}
 			None if self.lighting.is_none() => {
 				let properties = super::Environment::default().lighting_properties();
-				self.dom.insert(self.dom.root_ref(), InstanceBuilder::new("Lighting").with_properties(properties))
+				Some(self.dom.insert(self.dom.root_ref(), InstanceBuilder::new("Lighting").with_properties(properties)))
 			}
-			None => return,
+			None => None,
 		};
-		self.lighting = Some(lighting);
+		if lighting.is_some() {
+			self.lighting = lighting;
+		}
+		let own = self.clouds();
+		if place.is_none() && own.is_some() {
+			return;
+		}
+		if let Some(own) = own {
+			self.dom.transfer_within(own, Ref::none());
+		}
+		let terrain = self.terrain();
+		let clouds = match place.and_then(|place| place.clouds.map(|clouds| (place, clouds))) {
+			Some((place, clouds)) => {
+				let copy = place.dom.clone_into_external(clouds, &mut self.dom);
+				self.dom.transfer_within(copy, terrain);
+				copy
+			}
+			None => {
+				// (the values a new Clouds holds in Roblox, as Clouds::read reads one without them)
+				let off = InstanceBuilder::new("Clouds")
+					.with_property("Enabled", false)
+					.with_property("Cover", 0.5f32)
+					.with_property("Density", 0.7f32)
+					.with_property("Color", rbx_dom_weak::types::Color3::new(1.0, 1.0, 1.0));
+				self.dom.insert(terrain, off)
+			}
+		};
+		if let Some(instance) = self.dom.get_by_ref_mut(clouds) {
+			instance.name = CLOUDS_PATH[2].into();
+		}
+	}
+
+	/// The Terrain's Clouds it draws: a Clouds in its Workspace's Terrain.
+	pub fn clouds(&self) -> Option<Ref> {
+		let dom = &self.dom;
+		child_of_class(dom, dom.root_ref(), "Workspace").and_then(|workspace| child_of_class(dom, workspace, "Terrain")).and_then(|terrain| child_of_class(dom, terrain, "Clouds"))
+	}
+
+	/// Its Workspace's Terrain, made (and a Workspace for a model, which is not drawn) when there is none.
+	fn terrain(&mut self) -> Ref {
+		let root = self.dom.root_ref();
+		let workspace = match child_of_class(&self.dom, root, "Workspace") {
+			Some(workspace) => workspace,
+			None => self.dom.insert(root, InstanceBuilder::new("Workspace").with_name(CLOUDS_PATH[0])),
+		};
+		match child_of_class(&self.dom, workspace, "Terrain") {
+			Some(terrain) => terrain,
+			None => self.dom.insert(workspace, InstanceBuilder::new("Terrain").with_name(CLOUDS_PATH[1])),
+		}
 	}
 
 	/// Restricts drawing to one instance, found by a dotted path of names from the file's root

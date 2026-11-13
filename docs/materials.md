@@ -60,6 +60,9 @@ takes them) and `shaders/mesh.wgsl`. The general light and colour rules are in
 
 - Decals and Textures draw on their face with the part's lighting; a Texture tiles by its
   StudsPerTileU / V and offsets. Transparency and Color3 tint them; ZIndex orders decals on one face.
+- A Decal's UVOffset and UVScale map the face's uv to its image's as uv * UVScale + UVOffset: at
+  UVScale (2, 2) the image fills the face's top-left quarter, at UVOffset (0.25, 0) it moves left by a
+  quarter of the face. The face still bounds it.
 - On MeshParts and SpecialMeshes a decal follows rules measured mesh by mesh (`fs_decal` in
   `shaders/mesh.wgsl` and the decal code in `render/mod.rs` say which).
 

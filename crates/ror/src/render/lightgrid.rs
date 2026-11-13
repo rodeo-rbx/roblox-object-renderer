@@ -63,6 +63,11 @@ fn fill(part: &Part) -> Option<Fill> {
 	if !part.cast_shadow || part.transparency >= 1.0 {
 		return None;
 	}
+	// A part whose CFrame or size is not a number (a script's look-at along nothing leaves one) fills nothing: its box
+	// would make the grid's bounds NaN.
+	if !part.cframe.is_finite() || !part.size.is_finite() {
+		return None;
+	}
 	// lg-shapes: a 20-stud ball, a cylinder 12 across and a 24 x 12 x 24 wedge darken the floor
 	// under them as 0.79, 0.93 and 1 of their volume share would (the wedge's fit 0.98 puts 18 % fewer
 	// of its pixels within 2 of 255; corner wedges taken as wedges); a block turned 45 degrees by its
@@ -73,6 +78,8 @@ fn fill(part: &Part) -> Option<Fill> {
 		// SpecialMesh sphere it closes it as 0.89 of the ellipsoid's volume share would; other
 		// SpecialMesh types are taken as their box (not measured)
 		Geometry::Special { mesh_type: mesh_type::FILE_MESH, .. } => None,
+		// (the sphere's box is the mesh's Scale and Offset on the part: those must be numbers too)
+		Geometry::Special { mesh_type: mesh_type::SPHERE, scale, offset, .. } if !scale.is_finite() || !offset.is_finite() => None,
 		Geometry::Special { mesh_type: mesh_type::SPHERE, .. } => Some(Fill::Volume(Shape::Ellipsoid, 0.89)),
 		Geometry::Block | Geometry::Truss { .. } | Geometry::Special { .. } => Some(Fill::Box),
 		Geometry::Ball => Some(Fill::Volume(Shape::Ball, 0.79)),
@@ -370,7 +377,9 @@ fn frame(fillers: &[Filler]) -> (Vec3, [usize; 3]) {
 			}
 		}
 	}
-	let dims = [((max.x - min.x) / VOXEL) as usize, ((max.y - min.y) / VOXEL) as usize, ((max.z - min.z) / VOXEL) as usize];
+	// (at least a voxel along each axis: past about 1e11 studs a float cannot hold the cut's span around the middle, and
+	// the cut came out empty)
+	let dims = [((max.x - min.x) / VOXEL) as usize, ((max.y - min.y) / VOXEL) as usize, ((max.z - min.z) / VOXEL) as usize].map(|n| n.max(1));
 	(min, dims)
 }
 
@@ -684,6 +693,36 @@ mod tests {
 		let grid = build(&scene).unwrap();
 		assert_eq!(at(&grid, Vec3::new(2.0, 6.0, 2.0)), 0.0);
 		assert_eq!(at(&grid, Vec3::new(2.0, 10.0, 2.0)), 1.0);
+	}
+
+	/// A part whose CFrame is not a number (a script's look-at along nothing leaves one) fills no voxel, wherever it comes
+	/// among the parts: the grid is the other parts'. It made the grid's bounds NaN and every dimension 0 (a 0.86 x 0.43 x
+	/// 0.43 part among five), and `corner` divided by zero.
+	#[test]
+	fn a_part_that_is_not_a_number_fills_nothing() {
+		let roof = block(Vec3::new(-24.0, 8.0, -24.0), Vec3::new(24.0, 9.0, 24.0));
+		let floor = block(Vec3::new(-30.0, -1.0, -30.0), Vec3::new(30.0, 0.0, 30.0));
+		let mut lost = block(Vec3::ZERO, Vec3::new(0.86, 0.43, 0.43));
+		lost.cframe = Affine3A { matrix3: Mat3A::from_cols_array(&[f32::NAN; 9]), translation: Vec3A::splat(f32::NAN) };
+		let alone = build(&Scene { parts: vec![Arc::new(roof.clone()), Arc::new(floor.clone())], ..Default::default() }).unwrap();
+		for parts in [vec![roof.clone(), floor.clone(), lost.clone()], vec![lost.clone(), roof.clone(), floor.clone()]] {
+			let scene = Scene { parts: parts.into_iter().map(Arc::new).collect(), ..Default::default() };
+			assert_eq!(filler_count(&scene), 2);
+			let grid = build(&scene).unwrap();
+			assert_eq!((grid.origin, grid.dims), (alone.origin, alone.dims));
+			assert!(grid.values == alone.values);
+		}
+	}
+
+	/// A part parked very far off (1e11 studs) leaves the grid at least a voxel along each axis: a float cannot hold the
+	/// cut's span around the middle of such a scene, the cut came out empty, and `corner` divided by zero.
+	#[test]
+	fn a_part_parked_very_far_off_leaves_the_grid_a_voxel_at_least() {
+		let roof = block(Vec3::new(-24.0, 8.0, -24.0), Vec3::new(24.0, 9.0, 24.0));
+		let parked = block(Vec3::new(1.0e11, 0.0, 0.0), Vec3::new(1.0e11 + 4.0, 4.0, 4.0));
+		let grid = build(&Scene { parts: vec![Arc::new(roof), Arc::new(parked)], ..Default::default() }).unwrap();
+		assert!(grid.dims.iter().all(|&n| n >= 1), "{:?}", grid.dims);
+		assert_eq!(grid.values.len(), grid.dims.iter().product::<usize>());
 	}
 
 	#[test]

@@ -6,6 +6,9 @@ is compared with it pixel by pixel, or with Studio's own counters for `ror cost`
 (capturing its viewport, Windows only), `compare.rs`, `export.rs`, `mcp.rs` (the bridge client) and
 `calibrate.rs` with `calibrate/*` (the experiments).
 
+`<state dir>` is the [state folder](building.md#standalone-commands-and-state); a checkout defaults
+to `<checkout>/.cache`.
+
 ## What you need
 
 - Roblox Studio on Windows (captures read the viewport's pixels from its window).
@@ -52,8 +55,8 @@ Terrain's clouds, whose frames never settle in Studio. `tools/parity.py` reruns 
 R15 and R6 rigs and four classic catalog items, by asset id); `tools/survey.py` compares many instances
 of one place; `ror render --ids` plus `tools/analysis/part_errors.py` ranks a compare's parts by error.
 
-Captures are cached in `.cache/captures`, keyed by model, lighting, camera, size, Studio version and
-material generation: a rerun only renders ror's side. `ROR_RECAPTURE=1` captures again;
+Captures are cached in `<state dir>/captures`, keyed by model, lighting, camera, size, Studio version
+and material generation: a rerun only renders ror's side. `ROR_RECAPTURE=1` captures again;
 `ROR_CAPTURE_OFFLINE="<version>|<materials>"` replays stored captures without a Studio.
 Several capture Studios can run side by side (`ROR_CAPTURE_PLACE=<name>`); each is driven by one
 process at a time (a lock file). Analysis scripts: `tools/analysis/`.

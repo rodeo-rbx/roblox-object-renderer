@@ -1,122 +1,282 @@
-# The fork's releases: for every tag shaped like v0.1.0-rodeo.1, ror's binaries attached to a GitHub
-# release, named so mise (github: or ubi: backend) picks the right one per platform:
+# Release builds use only public source, a pinned toolchain and clean runners, with no build cache.
 #
-#   ror-v0.1.0-rodeo.1-macos-aarch64.tar.gz
-#   ror-v0.1.0-rodeo.1-macos-x86_64.tar.gz
-#   ror-v0.1.0-rodeo.1-windows-x86_64.zip
+# A push to main that changes release files, or a manual run, builds and smoke-tests every platform
+# without publishing (a dry run). A push of a tag vMAJOR.MINOR.PATCH publishes the release: the zips
+# of the dry run that passed on main at the tagged commit when there is one (tools/release/dry-run.mjs;
+# the release command tags only such a commit), so a tag needs no second build of the same source;
+# otherwise it builds and smoke-tests every platform itself first.
 #
-# Each archive holds the binary with LICENSE, NOTICE and THIRD_PARTY_NOTICES.md: a ror binary is
-# distributed under GPL-3.0-or-later (README, "Contributing, security and license"), and its source is
-# the tag's. It is built with the `dist` profile (thin LTO, stripped) and without the `x264` feature,
-# so MP4s go through ffmpeg. Linux is left out: ror is not tested there.
-#
-# Cutting a release: set `version` in Cargo.toml's [workspace.package] to the release's (upstream's
-# base version and the fork's count, 0.1.0-rodeo.1), commit, then `git tag v<version> && git push origin
-# v<version>`. The verify job refuses a tag that disagrees with Cargo.toml, so `ror --version` names the
-# release it came from.
+# Jobs: version -> build (one per platform) -> smoke (a fresh runner per platform) -> publish,
+# with notes written beside them. Only publish can write, and it runs nothing from the repository.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    # path filters do not apply to tags, so a tag always runs
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    paths:
+      - .github/workflows/release.yml
+      - tools/release/**
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/build.rs'
+      - .cargo/config.toml
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
+      - licenses/**
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
-env:
-  CARGO_TERM_COLOR: always
+# No release run is ever cancelled by another. Pushes to main share one group without cancelling: a
+# dry run that has started always finishes (the release command may be waiting on it), and a newer
+# push only replaces a dry run still waiting for it. A tag or a manual run is a group of its own.
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_type == 'branch' && github.ref || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  verify:
-    name: Verify
-    runs-on: ubuntu-latest
+  version:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read # to find the dry run of the tagged commit
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # the dry run whose zips a tag publishes; empty when this run builds them
+      dry-run: ${{ steps.dry-run.outputs.run-id }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Version from the tag
+          fetch-depth: 0
+      - name: Check manifest version and tag ancestry
         id: version
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - name: Cargo.toml's version matches the tag
-        shell: bash
         run: |
-          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "ror") | .version')
-          if [ "$cargo_version" != "${{ steps.version.outputs.version }}" ]; then
-            echo "::error::Cargo.toml's version is $cargo_version but the tag is ${{ github.ref_name }}"
-            exit 1
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_TYPE" == tag ]]; then
+            # a release: the manifests must say the tag's version, and the tagged commit must be on main
+            version=$(node tools/release/version.mjs --tag "$GITHUB_REF_NAME")
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          else
+            version=$(node tools/release/version.mjs)
           fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      # A tag publishes the zips the passing dry run of the same commit built and smoke-tested on
+      # every platform; build and smoke below then have nothing to do. Without one they run.
+      - name: Find the passing dry run of the tagged commit
+        id: dry-run
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/release/dry-run.mjs --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --artifacts ror-windows-x86_64,ror-linux-x86_64,ror-macos-aarch64 >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build (${{ matrix.name }})
-    needs: verify
-    runs-on: ${{ matrix.os }}
+    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macos-aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
-          - name: macos-x86_64
-            os: macos-latest
-            target: x86_64-apple-darwin
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - { runner: windows-latest, os: windows, arch: x86_64, target: x86_64-pc-windows-msvc, exe: ror.exe, rustflags: '-C target-feature=+crt-static' }
+          # the oldest Ubuntu runner, for the lowest glibc requirement
+          - { runner: ubuntu-22.04, os: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, exe: ror, rustflags: '' }
+          - { runner: macos-15, os: macos, arch: aarch64, target: aarch64-apple-darwin, exe: ror, rustflags: '' }
     env:
-      ASSET: ror-v${{ needs.verify.outputs.version }}-${{ matrix.name }}
+      VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_OS: ${{ matrix.os }}
+      RELEASE_ARCH: ${{ matrix.arch }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_EXE: ${{ matrix.exe }}
+      # The Windows executable carries the C runtime, so installing it needs no redistributable.
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           toolchain: "1.90.0"
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Test the release scripts
+        shell: bash
+        run: node --test tools/release/*.test.mjs
+      - name: Build with the public default features
+        shell: bash
+        run: cargo build --locked --profile dist --bin ror --target "$RELEASE_TARGET"
+      - name: List the licences of this target and package the zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release/licenses.mjs --target "$RELEASE_TARGET" --output release/THIRD_PARTY_LICENSES.txt
+          node tools/release/package.mjs \
+            --binary "target/$RELEASE_TARGET/dist/$RELEASE_EXE" \
+            --version "$VERSION" --os "$RELEASE_OS" --arch "$RELEASE_ARCH" \
+            --licenses release/THIRD_PARTY_LICENSES.txt \
+            --out release --commit "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+      - name: Upload the zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          key: ${{ matrix.target }}
-      - name: Build
-        run: cargo build --profile dist --locked -p ror --target ${{ matrix.target }}
-      - name: Package (Unix)
+          name: ror-${{ matrix.os }}-${{ matrix.arch }}
+          path: release/*.zip
+          if-no-files-found: error
+
+  smoke:
+    if: ${{ !github.event.repository.private && needs.version.outputs.dry-run == '' }}
+    needs: [version, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, os: windows, arch: x86_64, exe: ror.exe }
+          - { runner: ubuntu-22.04, os: linux, arch: x86_64, exe: ror }
+          - { runner: macos-15, os: macos, arch: aarch64, exe: ror }
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_OS: ${{ matrix.os }}
+      RELEASE_ARCH: ${{ matrix.arch }}
+      RELEASE_EXE: ${{ matrix.exe }}
+    steps:
+      # This checkout supplies only the smoke script and the fixture, in a subfolder. The executable is
+      # extracted outside it, so ror cannot take this checkout for its own.
+      - name: Check out the smoke script and fixture
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: inputs
+          persist-credentials: false
+          sparse-checkout: |
+            tools/release
+            fixtures/shapes.rbxmx
+          sparse-checkout-cone-mode: false
+      - name: Download the zip
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ror-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-assets
+      - name: Install a software Vulkan driver (Linux has no GPU)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y mesa-vulkan-drivers
+      - name: Extract the zip outside the checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP "release-assets/ror-$env:VERSION-$env:RELEASE_OS-$env:RELEASE_ARCH.zip"
+          $destination = Join-Path $env:RUNNER_TEMP 'standalone-ror'
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+      - name: Make the Linux and macOS executable runnable
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/dist/ror" .
-          tar -czf "$ASSET.tar.gz" ror LICENSE NOTICE THIRD_PARTY_NOTICES.md
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+          # Expand-Archive does not keep Unix permissions. The package script checks the stored 0755 mode.
+          chmod 755 "$RUNNER_TEMP/standalone-ror/ror"
+          test -x "$RUNNER_TEMP/standalone-ror/ror"
+      - name: Run the version check and a direct and a service render
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/dist/ror.exe" .
-          7z a "$ASSET.zip" ror.exe LICENSE NOTICE THIRD_PARTY_NOTICES.md
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          # The renders use WARP on Windows, lavapipe on Linux and Metal on macOS. No Studio or GUI helper
+          # is needed. Studio parity and GUI rendering cannot be checked here: Studio and rur are not installed.
+          node inputs/tools/release/smoke.mjs \
+            --binary "$RUNNER_TEMP/standalone-ror/$RELEASE_EXE" \
+            --fixture "$GITHUB_WORKSPACE/inputs/fixtures/shapes.rbxmx" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --version "$VERSION"
+
+  notes:
+    if: ${{ !github.event.repository.private && github.event_name == 'push' && github.ref_type == 'tag' }}
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: ${{ env.ASSET }}
-          path: ${{ env.ASSET }}.*
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Write release notes from public history
+        shell: bash
+        run: node tools/release/notes.mjs --tag "$GITHUB_REF_NAME" --output release-notes.md --repository "$GITHUB_REPOSITORY"
+      - name: Upload the release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
           if-no-files-found: error
 
-  release:
-    name: Create the release
-    needs: [verify, build]
-    runs-on: ubuntu-latest
+  # Runs after this run's build and smoke passed, or, when they were skipped, on the dry run's zips.
+  publish:
+    if: ${{ !cancelled() && !github.event.repository.private && github.event_name == 'push' && github.ref_type == 'tag' && needs.version.result == 'success' && needs.notes.result == 'success' && (needs.version.outputs.dry-run != '' || (needs.build.result == 'success' && needs.smoke.result == 'success')) }}
+    needs: [version, build, smoke, notes]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      actions: read # to download the dry run's zips
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      # No checkout, repository scripts or build tools in the only job with write permissions.
+      - name: Say which run built the zips
+        shell: bash
+        env:
+          DRY_RUN: ${{ needs.version.outputs.dry-run }}
+        run: |
+          if [ -n "$DRY_RUN" ]; then
+            echo "Publishing the zips that dry run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$DRY_RUN built and smoke-tested at $GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Publishing the zips this run built and smoke-tested" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Download the zips
+        if: ${{ needs.version.outputs.dry-run == '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: artifacts
+          pattern: ror-*
           merge-multiple: true
-      - name: List the assets
-        run: ls -l artifacts
-      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+          path: assets
+      - name: Download the zips the dry run of this commit built and smoke-tested
+        if: ${{ needs.version.outputs.dry-run != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          # The fork's -rodeo.N versions are its releases, not previews: the newest stays "Latest"
-          prerelease: false
-          files: artifacts/*
-          fail_on_unmatched_files: true
+          pattern: ror-*
+          merge-multiple: true
+          path: assets
+          run-id: ${{ needs.version.outputs.dry-run }}
+          github-token: ${{ github.token }}
+      - name: Download the release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum -- *.zip > SHA256SUMS
+      - name: Attest build provenance of the zips
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: assets/*.zip
+      - name: Create the release for the existing tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --verify-tag --title "ror $TAG" \
+            --notes-file notes/release-notes.md -R "$GITHUB_REPOSITORY" \
+            assets/*.zip assets/SHA256SUMS

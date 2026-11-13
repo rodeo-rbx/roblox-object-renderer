@@ -1291,10 +1291,11 @@ impl Playback {
 		self.motion.is_empty() && self.tweens.is_empty() && self.actions.iter().all(|action| action.set.is_empty() && action.enabled.is_none() && action.parent.is_none())
 	}
 
-	/// Whether it names the Lighting (a target or a new parent under it): a model file is then given
-	/// one for it to change ([`super::load::Document::give_lighting`]).
+	/// Whether it names the Lighting or the Terrain's Clouds (a target or a new parent under either): a
+	/// model file is then given them for it to change ([`super::load::Document::give_lighting`]).
 	pub fn touches_lighting(&self) -> bool {
-		let lighting = |path: &str| super::load::split_path(path).is_ok_and(|segments| segments.first().is_some_and(|first| first == "Lighting"));
+		let clouds = |segments: &[String]| segments.len() >= super::load::CLOUDS_PATH.len() && segments.iter().zip(super::load::CLOUDS_PATH).all(|(segment, name)| segment == name);
+		let lighting = |path: &str| super::load::split_path(path).is_ok_and(|segments| segments.first().is_some_and(|first| first == "Lighting") || clouds(&segments));
 		self.actions.iter().any(|action| lighting(&action.target) || action.parent.as_deref().is_some_and(lighting)) || self.tweens.iter().any(|tween| lighting(&tween.target))
 	}
 
@@ -1781,17 +1782,18 @@ impl Resolved<'_> {
 		self.channels.iter().find(|channel| channel.referent == referent && channel.property == property)
 	}
 
-	/// Whether all it changes over time is the Lighting, what is in it, and the post effects, Skies
-	/// and Atmospheres it moves (which draw nothing in the world): what is drawn stays as in the file,
-	/// and each moment needs only its Lighting read again (video.rs).
+	/// Whether all it changes over time is the Lighting, what is in it, the Terrain's Clouds, and the
+	/// post effects, Skies and Atmospheres it moves (which draw nothing in the world): what is drawn stays
+	/// as in the file, and each moment needs only its Lighting read again (video.rs).
 	pub fn changes_only_lighting(&self, document: &Document) -> bool {
+		let clouds = document.clouds();
 		let lit = |referent: Ref| -> bool {
 			if document.dom.get_by_ref(referent).is_some_and(|instance| environment_class(instance.class.as_str())) {
 				return true;
 			}
 			let mut current = referent;
 			while let Some(instance) = document.dom.get_by_ref(current) {
-				if Some(current) == document.lighting {
+				if Some(current) == document.lighting || Some(current) == clouds {
 					return true;
 				}
 				current = instance.parent();
@@ -1894,7 +1896,7 @@ impl Resolved<'_> {
 			trail.dropped_length = dropped;
 		}
 		// each emitter's particles on every core: what one emits depends on no other
-		scene.particles.par_iter_mut().for_each(|emitter| {
+		let play = |emitter: &mut super::particles::ParticleEmitter| {
 			let Some(referent) = emitter.referent else {
 				return;
 			};
@@ -2031,7 +2033,12 @@ impl Resolved<'_> {
 			births.retain(|birth| birth.age >= 0.0);
 			emitter.cframe = parent_now;
 			emitter.births = Some(births);
-		});
+		};
+		if crate::par::spread(scene.particles.len(), crate::par::CLIP_EMITTERS) {
+			scene.particles.par_iter_mut().for_each(play);
+		} else {
+			scene.particles.iter_mut().for_each(play);
+		}
 		// beams: TextureSpeed scrolls the texture frame by frame, each frame by its step times the speed
 		// set in that frame, from the frame the beam is enabled in; a disabled beam starts again at 0
 		// (beam-scroll: within 0.003 of a repeat in every mode, late, toggle and tween)

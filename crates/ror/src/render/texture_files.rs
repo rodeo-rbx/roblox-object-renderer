@@ -391,8 +391,9 @@ fn mark_used() {
 		return;
 	}
 	*last = Some(Instant::now());
-	let _ = std::fs::create_dir_all(directory());
-	let _ = std::fs::write(directory().join(".used"), b"");
+	let folder = directory();
+	let _ = std::fs::create_dir_all(&folder);
+	let _ = std::fs::write(folder.join(".used"), b"");
 }
 
 /// Keeps the folder within [`budget`] (the least recently used go) and removes other codes' folders

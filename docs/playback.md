@@ -63,6 +63,11 @@ The Lighting is a target like any instance: `Lighting.<Property>`, `Lighting.<ch
 - A `parent` action on `Lighting` with a `class` moves the Lighting's own of that class (the lent
   place's) out (`""`) or back (`"Lighting"`): ree's recordings write it when the run parks the
   place's look, as cutscene scripts often do.
+- The Terrain's Clouds go with it, at their path in a place: `Workspace.Terrain.Clouds.<Property>`
+  (Color, Cover, Density, Enabled). They are the clouds ror draws: a copy of `--lighting-from`'s,
+  else the file's own, else a disabled Clouds (no clouds, as ror's default environment draws) that a
+  playback can switch on. ree's recordings write them when the run changes the Terrain's clouds, as
+  a weather script does; every frame of a clip reads them again.
 
 ## The playback JSON
 

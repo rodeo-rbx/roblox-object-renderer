@@ -4,7 +4,7 @@ members = ["crates/ror", "crates/ror-mesh", "crates/ror-image", "crates/ror-asse
 default-members = ["crates/ror"]
 
 [workspace.package]
-version = "0.1.0-rodeo.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 license = "GPL-2.0-or-later"

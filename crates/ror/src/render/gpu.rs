@@ -137,6 +137,10 @@ pub struct Submitted(u64);
 /// poller waits on a Vulkan timeline semaphore of its own, signalled with each submission
 /// ([`Timeline`]), holding no wgpu lock, and polls only once that has moved: a poll that does not wait
 /// takes the fence for microseconds.
+///
+/// Metal has no such semaphore, and its wait in wgpu is a loop that reads the command buffer's status
+/// and sleeps 1 ms, the fence held throughout: the poller polls without waiting there and naps between
+/// polls holding nothing ([`poll_loop`]).
 struct Tracker {
 	state: Mutex<Track>,
 	/// a submission was done (for its waiters)
@@ -235,6 +239,8 @@ impl Timeline {
 /// GPU slots going back).
 fn poll_loop(device: wgpu::Device, tracker: Arc<Tracker>) {
 	let mut early = 0u32;
+	#[cfg(target_vendor = "apple")]
+	let mut naps = 0u32;
 	loop {
 		let next = {
 			let mut state = tracker.state.lock();
@@ -257,6 +263,27 @@ fn poll_loop(device: wgpu::Device, tracker: Arc<Tracker>) {
 					true
 				}
 			},
+			// Metal: a wait inside the poll holds wgpu's fence through a 1 ms sleep (wgpu-hal's Metal
+			// `wait` reads the command buffer's status, then sleeps), and every submission takes that
+			// fence first: eight threads drawing small views got through under two submissions a
+			// millisecond between them, each waiting out the rest of a sleep. A poll that does not wait
+			// reads the same status in microseconds, so the sleep is taken here, holding nothing: short
+			// while work finishes quickly, longer once the GPU is on something long.
+			#[cfg(target_vendor = "apple")]
+			None => {
+				{
+					let _one = tracker.poll_lock.lock();
+					let _ = device.poll(wgpu::PollType::Poll);
+				}
+				if tracker.state.lock().done < next {
+					naps += 1;
+					std::thread::sleep(if naps > BRIEF_NAPS { LONG_NAP } else { BRIEF_NAP });
+				} else {
+					naps = 0;
+				}
+				continue;
+			}
+			#[cfg(not(target_vendor = "apple"))]
 			None => {
 				// no timeline: a short wait inside the poll (holding wgpu's fence), as every waiter did
 				let _one = tracker.poll_lock.lock();
@@ -281,6 +308,18 @@ fn poll_loop(device: wgpu::Device, tracker: Arc<Tracker>) {
 		}
 	}
 }
+
+/// Metal's poller sleeps this long between polls that found the next submission not done
+/// ([`poll_loop`]), for its first [`BRIEF_NAPS`] such polls in a row: a small view is back within a
+/// few of them.
+#[cfg(target_vendor = "apple")]
+const BRIEF_NAP: Duration = Duration::from_micros(50);
+#[cfg(target_vendor = "apple")]
+const BRIEF_NAPS: u32 = 40;
+/// And this long after them: the GPU is on something long, and a poll four times a millisecond still
+/// answers sooner than the 1 ms sleeps of wgpu's own wait did.
+#[cfg(target_vendor = "apple")]
+const LONG_NAP: Duration = Duration::from_micros(250);
 
 /// Queued writes past this are submitted and waited for ([`Gpu::uploaded`]).
 const UPLOAD_FLUSH_BYTES: u64 = 64 << 20;
@@ -539,10 +578,11 @@ impl Gpu {
 			&& let Some(key) = wgpu::util::pipeline_cache_key(&adapter_info)
 		{
 			let name = format!("pipelines/{key}");
-			let file = crate::output::state_dir().join(&name);
+			let state = crate::output::state_dir();
+			let file = state.join(&name);
 			// a state dir without one starts from the content store's (what another build or checkout
 			// made on this machine: the driver checks it is its own)
-			let data = crate::output::read_state_file(&crate::output::state_dir(), &name).filter(|data| data.len() <= MAX_PIPELINE_CACHE);
+			let data = crate::output::read_state_file(&state, &name).filter(|data| data.len() <= MAX_PIPELINE_CACHE);
 			read_len = data.as_ref().map_or(0, Vec::len);
 			// SAFETY: the data is what `get_data` wrote for an adapter with the same key (the file name);
 			// `fallback` makes a corrupt or foreign file an empty cache
@@ -826,5 +866,44 @@ impl Gpu {
 impl Drop for Gpu {
 	fn drop(&mut self) {
 		self.stop();
+	}
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+	use std::time::{Duration, Instant};
+
+	use super::Gpu;
+
+	/// A little work is waited for in a fraction of a millisecond, alone and beside another thread's:
+	/// the poller looks every 50 µs and holds wgpu's fence only while it looks. Waiting inside the
+	/// poll, it slept 1 ms with the fence held, so no wait was shorter than that and a submission made
+	/// meanwhile waited for the fence first.
+	#[test]
+	fn a_small_submission_is_back_within_a_millisecond() {
+		let gpu = Gpu::new().expect("a GPU");
+		let buffer = |usage| gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("poller test"), size: 4096, usage, mapped_at_creation: false });
+		let (from, to) = (buffer(wgpu::BufferUsages::COPY_SRC), buffer(wgpu::BufferUsages::COPY_DST));
+		// something for the GPU to do, submitted and waited for: the middle one of 200 such waits
+		let median = || {
+			let mut took: Vec<Duration> = (0..200)
+				.map(|_| {
+					let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+					encoder.copy_buffer_to_buffer(&from, 0, &to, 0, Some(4096));
+					let started = Instant::now();
+					gpu.wait_for(gpu.submit([encoder.finish()])).expect("the GPU did the work");
+					started.elapsed()
+				})
+				.collect();
+			took.sort();
+			took[took.len() / 2]
+		};
+		let alone = median();
+		let beside = std::thread::scope(|scope| {
+			let other = scope.spawn(median);
+			(median(), other.join().expect("the other thread"))
+		});
+		assert!(alone < Duration::from_micros(600), "half of 200 waits took {alone:?} or more");
+		assert!(beside.0.max(beside.1) < Duration::from_micros(600), "half of 200 waits took {beside:?} or more beside another thread's");
 	}
 }

@@ -1,7 +1,8 @@
 # The render service
 
 `ror render` and `ror video` send their job to a render service, started on first use and shared by
-every process using the same state dir (`.cache`, or `ROR_STATE_DIR`). It keeps the GPU device,
+every process using the same state dir ([building.md](building.md#standalone-commands-and-state);
+a checkout defaults to `<checkout>/.cache`, `ROR_STATE_DIR` sets another). It keeps the GPU device,
 pipelines, meshes, textures and parsed models loaded and runs jobs side by side. The code is in
 `crates/ror/src/service` (the service, its HTTP server and client), `crates/ror/src/job.rs` (a render
 job) and `crates/ror/src/budget.rs` (memory admission). `--no-service` (or `ROR_NO_SERVICE=1`) runs a
@@ -24,18 +25,17 @@ ror render Model.rbxm --no-service   # render in this process instead
   is fine: it watches the executable that started it and, once a rebuild has replaced that, starts
   the new build's service, which has the old one exit once it is up (`ROR_SERVICE_SUCCESSOR=0` turns
   that off). Checkouts sharing one state dir (different builds) each get their own service.
-- 10 s after its last job (`ROR_QUIET_RELEASE=<seconds>`) it hands over to a dormant copy of itself
-  that holds the GPU's adapter but no device (~30 MB) and makes its device for the next job in
-  0.12-0.25 s. The copy exits 10 minutes after the last job (`ROR_SERVICE_IDLE=<seconds>`);
-  `ROR_SERVICE_HANDOVER=0` drops the device in the same process instead.
-- It gives memory back as it goes quiet: 2 s after the last job the allocator's free pages and the
-  GPU's dropped resources, 10 s after it the kept targets, buffers, preparations, shadow maps, clip
-  inputs, GUI images and posed skins, 60 s after it the textures, meshes and sky maps.
-- A new service starts in under a second: the GPU device on Vulkan (every backend only without a
-  discrete Vulkan GPU), with only its GPU's Vulkan driver loaded once a service has found it
-  (`<state dir>/gpu.json`; `ROR_VULKAN_FILTER=0` loads every driver; no ror process loads Vulkan's
-  implicit layers, overlays and capture tools unless `ROR_VULKAN_LAYERS=1`), and its pipelines from
-  ror's own pipeline cache (`<state dir>/pipelines`; `ROR_PIPELINE_CACHE=0` turns it off).
+- After `ROR_QUIET_RELEASE` seconds without a job (10 by default, at most 2 while a game runs), it
+  goes dormant and releases its GPU device and in-memory caches. It normally hands over to a
+  dormant copy of itself and exits; `ROR_SERVICE_HANDOVER=0` keeps it in the same process. The copy
+  holds the GPU's adapter but no device (~30 MB). The next job makes the device again, which takes
+  0.12-0.25 s in the copy. `ROR_SERVICE_IDLE=<seconds>` sets the idle timeout (10 minutes by
+  default).
+- A new service starts in under a second. By default it prefers a discrete Vulkan GPU. On Windows
+  it can reuse the Vulkan driver choice in `<state dir>/gpu.json` (`ROR_VULKAN_FILTER=0` turns this
+  off). It turns Vulkan's implicit layers (overlays, capture tools) off, unless
+  `VK_LOADER_LAYERS_DISABLE` is set or `ROR_VULKAN_LAYERS=1`. It can reuse its pipelines from
+  `<state dir>/pipelines` (`ROR_PIPELINE_CACHE=0` turns it off).
 - `ror service warm` (`POST /warm`) starts the service if needed and keeps the GPU busy for one burst
   of at most 0.5 s, ended as soon as a job starts: a GPU idle a few seconds drops to its idle clocks,
   and a clip after a pause ran its first frames slowly. Nothing runs while the service is otherwise
@@ -51,14 +51,19 @@ ror render Model.rbxm --no-service   # render in this process instead
   least recently used go. Skies keep their decoded skyboxes (64 MB, `ROR_SKY_CACHE_MB`) and the maps
   made for each Lighting (64 MB, `ROR_ENVIRONMENT_CACHE_MB`); prepared parts and shadow maps
   `ROR_PREPARED_CACHE_MB` (256) and `ROR_SHADOW_CACHE_MB` (128).
-- Before each job the service keeps within the GPU memory the system gives it: past 85 % of it, what
-  it keeps for later renders goes, least recently used first (`/health` shows `caches.vram`). Each
-  byte the service keeps on the GPU also commits a byte of system memory.
+- On Vulkan with `VK_EXT_memory_budget`, the service checks GPU memory before each job. Past 85 % of
+  the GPU memory the system gives it, it frees what it keeps for later renders towards 70 %, and
+  within the caches the least recently used goes first (`/health` shows `caches.vram`). While a game
+  runs it also checks during jobs, and frees kept caches when less than 10 % of the GPU is free
+  instead. Direct3D 12 and Metal skip this check. On Windows each byte the service keeps on the GPU
+  also commits a byte of system memory.
 
 ## Memory admission
 
 Many callers at once can fill a machine, so jobs are admitted against memory
-(`crate::budget::admit`):
+(`crate::budget::admit`). ror reads the machine's and the process's memory only on Windows, so Linux
+and macOS have no memory floor, no queuing for memory, no cache relief when memory runs low and no
+process cap. On Windows:
 
 1. A process's first job starts once the machine has a floor of memory free (`ROR_MEMORY_FLOOR_GB`,
    default 12 % of the machine's memory and at least 4 GB; 0 turns it off), and fails
@@ -74,7 +79,7 @@ Many callers at once can fill a machine, so jobs are admitted against memory
    came, or once its command has gone.
 4. While jobs run, a service whose machine falls under the floor has the caches relieved, every 3 s
    while it lasts.
-5. On Windows every ror process (and the ffmpeg and rur processes it starts) runs in a job object
+5. Every ror process (and the ffmpeg and rur processes it starts) runs in a job object
    capping its committed memory (`ROR_MAX_MEMORY_GB`, default 40 % of the machine's memory and at
    least 6 GB; 0 turns it off), so one growing past it fails with an out-of-memory error instead of the
    machine paging until it stalls.
@@ -85,17 +90,21 @@ reserves 100 times its input's size while it runs, and jobs missing the same fil
 it. A ror process works with half the logical processors and at most 8 threads in each of its two
 thread pools (`RAYON_NUM_THREADS` sets another number).
 
-Beside a game: if a monitor writes a status file and `ROR_GAMING_STATUS` names it, then while it says
-a game runs the floor counts the game's working set as taken and every draw waits until the GPU keeps
-10 % of its memory free (`crate::gaming` has the JSON format). `ROR_GPU_PRIORITY=low` makes the
-device's queue use Vulkan's low global priority.
+If a monitor writes a status file and `ROR_GAMING_STATUS` names it, ror uses it to tell when a game
+runs (`crate::gaming` has the JSON format).
+
+Service draws that need more GPU memory can wait for room when ror can read the GPU's free memory:
+on Vulkan with `VK_EXT_memory_budget` or, on Windows, through the adapter's memory counter.
+Direct3D 12 and Metal skip this wait, as do direct commands (`--no-service`). While a game runs, a
+draw that still cannot fit fails after `ROR_MEMORY_WAIT` seconds (60 by default), saying why.
+`ROR_GPU_PRIORITY=low` asks for Vulkan's low global priority where the driver supports it.
 
 
 ## HTTP API
 
-The service speaks HTTP on `127.0.0.1`; the latest service's port is in `.cache/service.json`, each
-build's in `.cache/services/<build>.json`. Every request needs the header `X-ROR: 1` (it keeps
-browsers out; see [SECURITY.md](../SECURITY.md)).
+The service speaks HTTP on `127.0.0.1`; the latest service's port is in `<state dir>/service.json`,
+each build's in `<state dir>/services/<build>.json`. Every request needs the header `X-ROR: 1`
+(it keeps browsers out; see [SECURITY.md](../SECURITY.md)).
 
 - `GET /health`: status, caches, admission (running and queued jobs, their needs), loads in flight,
   `commitBytes`.
@@ -137,6 +146,6 @@ is a sampling profiler for Windows.
 
 `ROR_GPU_PROFILE=1` prints per-view GPU pass times in milliseconds to stderr (a service writes them
 to its `serve.log`); `ROR_PROFILE=1` logs each wait for a load over 50 ms.
-`ROR_RENDERDOC=<path to renderdoc.dll>` (with `--no-service`) captures views for RenderDoc: each
-view's submission is one capture, `ROR_RENDERDOC_VIEWS=<n>` or `<first>-<last>` picks which (default
-the first), `ROR_RENDERDOC_OUT` sets the file template.
+On Windows, `ROR_RENDERDOC=<path to renderdoc.dll>` (with `--no-service`) captures views for
+RenderDoc: each view's submission is one capture, `ROR_RENDERDOC_VIEWS=<n>` or `<first>-<last>`
+picks which (default the first), `ROR_RENDERDOC_OUT` sets the file template.

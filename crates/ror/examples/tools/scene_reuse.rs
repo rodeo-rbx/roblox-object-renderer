@@ -84,6 +84,7 @@ pub fn main() -> Result<()> {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		match ror::video::check_scene_reuse(&job, &scenes, &times) {
 			Ok((0, ..)) => skipped += 1,

@@ -76,6 +76,16 @@ pub struct Job {
 	/// process's own.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub relative_to: Option<PathBuf>,
+	/// With `ids`: how much of this instance (dotted path from the file's root) each view shows ([`Alone`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub alone: Option<String>,
+}
+
+/// How much of an instance a view shows (`--alone`): its parts' pixels in the view, and drawn with nothing else.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Alone {
+	pub shown: u32,
+	pub whole: u32,
 }
 
 /// A world drawn around the model (`--map`, [`scene::load::Document::add_setting`]): never framed, and
@@ -134,6 +144,8 @@ pub struct ViewResult {
 	/// With the view's `lod`: the levels its meshes drew at and the parts left out (render::LodView)
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub lod: Option<crate::render::LodView>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub alone: Option<Alone>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -219,23 +231,12 @@ struct PlaceSettings {
 	lighting: Option<scene::load::LightingCopy>,
 }
 
-/// A place's Lighting given to a playback's document ([`SceneCache::give_lighting`]): its scene
-/// takes the place's Clouds too (the Terrain's, which the copy leaves behind).
-pub(crate) struct Lent {
-	clouds: Option<scene::environment::Clouds>,
-}
-
-impl Lent {
-	pub(crate) fn finish(&self, scene: &mut Scene) {
-		scene.environment.clouds = self.clouds;
-	}
-}
-
 /// Parsed scenes, kept while their file is unchanged (the service reuses them across requests).
 #[derive(Default)]
 pub struct SceneCache {
-	/// By file, selection and the folder its relative local paths are read from
-	entries: Mutex<HashMap<(PathBuf, Option<String>, Option<PathBuf>), (SystemTime, u64, Arc<Scene>)>>,
+	/// By file, selection, the folder its relative local paths are read from and whether it keeps the
+	/// invisible parts (the collisions-only view's: [`scene::load::Document::keep_invisible`])
+	entries: Mutex<HashMap<(PathBuf, Option<String>, Option<PathBuf>, bool), (SystemTime, u64, Arc<Scene>)>>,
 	places: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<PlaceSettings>)>>,
 	maps: Mutex<HashMap<PathBuf, (SystemTime, u64, Arc<scene::load::Document>)>>,
 	/// Videos' inputs ([`crate::video::FixedInput`]) by [`SceneCache::video_key`], the last used last
@@ -429,21 +430,21 @@ impl SceneCache {
 		Ok(())
 	}
 
-	/// Gives a playback's document the Lighting it changes, when it names one: `lighting_from`'s (a
-	/// copy), else the document's own, else ror's default ([`scene::load::Document::give_lighting`]).
-	/// What it lent from `lighting_from` is for the scene ([`Lent::finish`]), which then takes no
-	/// Lighting from [`SceneCache::lend`].
-	pub(crate) fn give_lighting(&self, document: &mut scene::load::Document, playback: &scene::Playback, lighting_from: Option<&str>) -> Result<Option<Lent>> {
+	/// Gives a playback's document the Lighting and the Terrain's Clouds it changes, when it names
+	/// either: `lighting_from`'s (a copy), else the document's own, else ror's default
+	/// ([`scene::load::Document::give_lighting`]). True when the document holds `lighting_from`'s: its
+	/// scene then takes no Lighting from [`SceneCache::lend`].
+	pub(crate) fn give_lighting(&self, document: &mut scene::load::Document, playback: &scene::Playback, lighting_from: Option<&str>) -> Result<bool> {
 		if !playback.touches_lighting() {
-			return Ok(None);
+			return Ok(false);
 		}
 		let Some(path) = lighting_from else {
 			document.give_lighting(None);
-			return Ok(None);
+			return Ok(false);
 		};
 		let place = self.place(Path::new(path))?;
 		document.give_lighting(Some(place.lighting.as_ref().with_context(|| format!("{path} has no Lighting"))?));
-		Ok(Some(Lent { clouds: place.environment.as_ref().and_then(|environment| environment.clouds) }))
+		Ok(true)
 	}
 
 	/// A scene at a moment of a playback (not cached: every job has its own).
@@ -456,10 +457,10 @@ impl SceneCache {
 		Ok(scene)
 	}
 
-	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>) -> Result<(Arc<Scene>, bool)> {
+	fn load(&self, path: &Path, select: Option<&str>, relative_to: Option<&Path>, keep_invisible: bool) -> Result<(Arc<Scene>, bool)> {
 		let metadata = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
 		let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf));
+		let key = (path.to_path_buf(), select.map(str::to_string), relative_to.map(Path::to_path_buf), keep_invisible);
 		let cached = || self.entries.lock().get(&key).filter(|(time, size, _)| *time == modified && *size == metadata.len()).map(|(_, _, scene)| (scene.clone(), true));
 		if let Some(hit) = cached() {
 			return Ok(hit);
@@ -468,6 +469,7 @@ impl SceneCache {
 			// the parse and the extraction within the machine's free memory, as one load
 			let _budget = crate::budget::reserve(metadata.len());
 			let mut document = scene::load::read_file(path)?;
+			document.keep_invisible = keep_invisible;
 			if let Some(select) = select {
 				document.select(select)?;
 			}
@@ -556,6 +558,29 @@ pub fn run(renderer: &Renderer, scenes: &SceneCache, job: &Job) -> Result<JobRes
 	run_gated(renderer, scenes, job, None)
 }
 
+/// Each view's [`Alone`] for the instance at `path`: its parts' ids counted in `images`, and in the same views
+/// drawn again from the same cameras with only those parts.
+fn alone(renderer: &Renderer, scene: &Scene, path: &str, requests: &[ViewRequest], images: &[crate::render::ViewImage], gpu: Option<&crate::budget::GpuGate>) -> Result<Vec<Alone>> {
+	let under = format!("{path}.");
+	let mine: Vec<usize> = scene.parts.iter().enumerate().filter(|(_, part)| part.path == path || part.path.starts_with(&under)).map(|(index, _)| index).collect();
+	if mine.is_empty() {
+		bail!("--alone {path:?}: no part is at or under it");
+	}
+	let only = Scene { parts: mine.iter().map(|&index| scene.parts[index].clone()).collect(), environment: scene.environment.clone(), ..Default::default() };
+	let again: Vec<ViewRequest> = requests
+		.iter()
+		.zip(images)
+		.map(|(request, image)| ViewRequest { camera: CameraSpec::CFrame { components: image.camera.cframe_components(), fov: image.camera.fov, near: Some(image.camera.near) }, bloom: false, ..request.clone() })
+		.collect();
+	let (drawn, _) = render_in_groups(renderer, &only, &again, gpu)?;
+	let mut is_mine = vec![false; scene.parts.len() + 1];
+	for &index in &mine {
+		is_mine[index + 1] = true;
+	}
+	let count = |ids: Option<&[u32]>, of: &dyn Fn(u32) -> bool| ids.unwrap_or(&[]).iter().filter(|&&id| of(id)).count() as u32;
+	Ok(images.iter().zip(&drawn).map(|(image, alone)| Alone { shown: count(image.ids.as_deref(), &|id| is_mine[id as usize]), whole: count(alone.ids.as_deref(), &|id| id > 0) }).collect())
+}
+
 /// [`run`], each draw admitted within the GPU's free memory by `gpu` (loading, readbacks and PNG encoding
 /// run outside it).
 pub fn run_gated(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option<&crate::budget::GpuGate>) -> Result<JobResult> {
@@ -597,7 +622,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 	let path = Path::new(&job.input);
 	// the places lending MaterialService and Lighting: those named, else a map's own
 	let (materials_from, lighting_from) = scenes.lenders(job.map.as_ref(), job.materials_from.as_deref(), job.lighting_from.as_deref())?;
-	// a playback that changes the Lighting has `lighting_from`'s in its document already
+	// a playback that changes the Lighting or the Terrain's Clouds has `lighting_from`'s in its document already
 	let mut lent_lighting = false;
 	// the cost model reads the document the scene came from (its parts' referents point into it)
 	let mut cost_document = None;
@@ -611,6 +636,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			let fetched = renderer.assets.fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", job.input))?;
 			scene::load::read_bytes(&fetched.bytes)?
 		};
+		document.keep_invisible = job.collision.is_some();
 		if let Some(select) = &job.select {
 			document.select(select)?;
 		}
@@ -627,8 +653,8 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 				}
 				document.play = playback.play;
 				document.salt = playback.salt.clone();
-				let lent = scenes.give_lighting(&mut document, playback, lighting_from)?;
-				let mut scene = if job.cost.is_some() {
+				lent_lighting = scenes.give_lighting(&mut document, playback, lighting_from)?;
+				let scene = if job.cost.is_some() {
 					let resolved = playback.resolve(&document)?;
 					resolved.apply_state(&mut document)?;
 					let mut scene = scene::extract::extract(&document);
@@ -638,10 +664,6 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 				} else {
 					scenes.load_playback(document, playback)?
 				};
-				if let Some(lent) = &lent {
-					lent.finish(&mut scene);
-				}
-				lent_lighting = lent.is_some();
 				(Arc::new(scene), false)
 			}
 			None => {
@@ -653,11 +675,12 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			}
 		}
 	} else if path.is_file() {
-		scenes.load(path, job.select.as_deref(), job.relative_to.as_deref())?
+		scenes.load(path, job.select.as_deref(), job.relative_to.as_deref(), job.collision.is_some())?
 	} else {
 		let uri = if job.input.chars().all(|c| c.is_ascii_digit()) { format!("rbxassetid://{}", job.input) } else { job.input.clone() };
 		let fetched = renderer.assets.fetch(&uri).map_err(|error| anyhow::anyhow!("{} is not a file, and as an asset: {error}", job.input))?;
 		let mut document = scene::load::read_bytes(&fetched.bytes)?;
+		document.keep_invisible = job.collision.is_some();
 		if let Some(select) = &job.select {
 			document.select(select)?;
 		}
@@ -729,6 +752,10 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 		(Vec::new(), RenderStats::default())
 	} else {
 		render_in_groups(renderer, &scene, &requests, gpu)?
+	};
+	let alone = match &job.alone {
+		Some(path) if images.iter().any(|image| image.ids.is_some()) => alone(renderer, &scene, path, &requests, &images, gpu)?,
+		_ => Vec::new(),
 	};
 	let bounds = if cameras_only {
 		let subject = scene.framing_subject();
@@ -816,6 +843,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &Job, gpu: Option
 			fov: camera.fov,
 			near: camera.near,
 			lod: images.get(index).and_then(|image| image.lod.clone()),
+			alone: alone.get(index).copied(),
 		});
 	}
 	let cost = match (&job.cost, &cost_document) {
@@ -885,6 +913,7 @@ mod tests {
 				map: None,
 				cost: None,
 				relative_to: relative_to.map(Path::to_path_buf),
+				alone: None,
 			}
 		};
 		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
@@ -906,6 +935,142 @@ mod tests {
 			let (missing, unmeshed) = drawn(&render(&format!("{name}-here"), mesh, None));
 			assert!(no_quad(&missing) && unmeshed != by_path, "{name} read from here: {missing:?}");
 		}
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	/// A still of a playback that sets the Terrain's Clouds draws the stage's clouds as it leaves them.
+	#[test]
+	fn a_still_draws_the_stages_clouds_as_the_playback_leaves_them() {
+		use rbx_dom_weak::{InstanceBuilder, WeakDom, types::Color3};
+		let folder = std::env::temp_dir().join(format!("ror-still-clouds-{}", std::process::id()));
+		std::fs::create_dir_all(&folder).unwrap();
+		let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
+		let root = place.root_ref();
+		let workspace = place.insert(root, InstanceBuilder::new("Workspace").with_name("Workspace"));
+		let terrain = place.insert(workspace, InstanceBuilder::new("Terrain").with_name("Terrain"));
+		place.insert(terrain, InstanceBuilder::new("Clouds").with_name("Clouds").with_property("Cover", 0.84f32).with_property("Density", 0.03f32).with_property("Color", Color3::new(2.5, 3.49, 4.98)));
+		let lighting = place.insert(root, InstanceBuilder::new("Lighting").with_name("Lighting"));
+		let stage = folder.join("stage.rbxl");
+		let mut bytes = Vec::new();
+		rbx_binary::to_writer(&mut bytes, &place, &[workspace, lighting]).unwrap();
+		std::fs::write(&stage, bytes).unwrap();
+		let mut model = crate::scene::build::ModelBuilder::new("Model");
+		model.part(&crate::scene::build::PartSpec::default());
+		let playback: scene::Playback = serde_json::from_value(serde_json::json!({
+			"time": 0.5,
+			"actions": [{"at": 0.2, "target": "Workspace.Terrain.Clouds", "set": {"Cover": 0.95, "Color": [0.27451, 0.2902, 0.3451]}}],
+		}))
+		.unwrap();
+		let scenes = SceneCache::default();
+		let mut document = model.into_document();
+		assert!(scenes.give_lighting(&mut document, &playback, Some(&stage.display().to_string())).unwrap(), "the stage's look is in the document");
+		let clouds = scenes.load_playback(document, &playback).unwrap().environment.clouds.expect("the stage's clouds");
+		assert!((clouds.cover - 0.95).abs() < 1e-6 && (clouds.density - 0.03).abs() < 1e-6 && clouds.color.abs_diff_eq(glam::Vec3::new(0.27451, 0.2902, 0.3451), 1e-5), "{clouds:?}");
+		let _ = std::fs::remove_dir_all(&folder);
+	}
+
+	/// The collisions-only view draws an invisible wall that collides as it draws the same wall seen, and
+	/// leaves out one that does not collide; a render without the view still draws nothing of either.
+	#[test]
+	fn the_collision_view_draws_invisible_parts_that_collide() {
+		if !scene::collision::AVAILABLE {
+			return;
+		}
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use crate::scene::collision::Filter;
+		let state = std::env::temp_dir().join(format!("ror-collision-invisible-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		// a floor and, in front of the camera, a wall (its Transparency and CanCollide) or none
+		let model = |name: &str, wall: Option<(f32, bool)>| {
+			let mut model = ModelBuilder::new("Model");
+			model.part(&PartSpec { name: "Floor".into(), cframe: glam::Affine3A::from_translation(Vec3::new(0.0, -3.0, 0.0)), size: Vec3::new(12.0, 1.0, 12.0), ..Default::default() });
+			if let Some((transparency, can_collide)) = wall {
+				let part = model.part(&PartSpec { name: "Wall".into(), size: Vec3::new(6.0, 4.0, 1.0), color: [40, 120, 220], transparency, ..Default::default() });
+				model.set(part, "CanCollide", can_collide);
+			}
+			let input = state.join(format!("{name}.rbxm"));
+			std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
+			input
+		};
+		let inputs = [("none", None), ("seen", Some((0.0, true))), ("invisible", Some((1.0, true))), ("ghost", Some((1.0, false)))].map(|(name, wall)| (name, model(name, wall)));
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let scenes = SceneCache::default();
+		let drawn = |name: &str, collision: Option<Filter>| {
+			let input = &inputs.iter().find(|(wall, _)| *wall == name).unwrap().1;
+			let camera = CameraSpec::LookAt { eye: [0.0, 1.0, -10.0], target: [0.0; 3], fov: 50.0 };
+			let job = Job {
+				input: input.display().to_string(),
+				select: None,
+				out: Some(state.join(format!("{name}-{}", if collision.is_some() { "collision" } else { "plain" }))),
+				views: vec![NamedView { name: "front".into(), view: ViewRequest { width: 64, height: 64, camera, ..Default::default() } }],
+				no_png: false,
+				compact_png: false,
+				materials_from: None,
+				lighting_from: None,
+				playback: None,
+				frame: None,
+				focus: None,
+				collision,
+				map: None,
+				cost: None,
+				relative_to: None,
+				alone: None,
+			};
+			let result = run(&renderer, &scenes, &job).unwrap();
+			(result.parts, std::fs::read(result.views[0].file.as_ref().unwrap()).unwrap())
+		};
+		let plain = |name: &str| drawn(name, None);
+		let collision = |name: &str| drawn(name, Some(Filter::Collide));
+		assert!(plain("seen") != plain("none"), "the camera sees the wall");
+		assert!(plain("invisible") == plain("none") && plain("ghost") == plain("none"), "an invisible wall draws nothing");
+		assert!(collision("seen") != collision("none"), "the view sees the wall");
+		let (invisible, seen) = (collision("invisible"), collision("seen"));
+		assert!(invisible == seen, "an invisible wall collides as the wall seen ({} parts drawn, {} with the wall seen)", invisible.0, seen.0);
+		assert!(collision("ghost") == collision("none"), "a wall that does not collide is left out");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+
+	#[test]
+	fn alone_counts_what_hides_an_instance_in_each_view() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		let state = std::env::temp_dir().join(format!("ror-alone-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		// a block, and between it and the front camera a wall over its left half
+		let mut model = ModelBuilder::new("Model");
+		model.part(&PartSpec { name: "Subject".into(), size: Vec3::new(2.0, 2.0, 2.0), ..Default::default() });
+		model.part(&PartSpec { name: "Wall".into(), cframe: glam::Affine3A::from_translation(Vec3::new(3.0, 0.0, -4.0)), size: Vec3::new(6.0, 6.0, 0.5), ..Default::default() });
+		let input = state.join("model.rbxm");
+		std::fs::write(&input, model.to_rbxm().unwrap()).unwrap();
+		let gpu = Arc::new(crate::render::gpu::Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(state.join("cache")) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let view = |name: &str, z: f32| NamedView { name: name.into(), view: ViewRequest { width: 96, height: 96, ids: true, camera: CameraSpec::LookAt { eye: [0.0, 0.0, z], target: [0.0; 3], fov: 40.0 }, ..Default::default() } };
+		let job = |alone: &str| Job {
+			input: input.display().to_string(),
+			select: None,
+			out: Some(state.join("out")),
+			views: vec![view("front", -12.0), view("back", 12.0)],
+			no_png: true,
+			compact_png: false,
+			materials_from: None,
+			lighting_from: None,
+			playback: None,
+			frame: None,
+			focus: None,
+			collision: None,
+			map: None,
+			cost: None,
+			relative_to: None,
+			alone: Some(alone.into()),
+		};
+		let result = run(&renderer, &SceneCache::default(), &job("Model.Subject")).unwrap();
+		let [front, back] = [result.views[0].alone.unwrap(), result.views[1].alone.unwrap()];
+		assert!(front.whole > 100 && back.whole == front.whole, "the block alone fills the same pixels from both sides: {front:?} {back:?}");
+		assert_eq!(back.shown, back.whole, "nothing hides it from behind");
+		assert!(front.shown * 3 > front.whole && front.shown * 3 < front.whole * 2, "the wall hides about half of it from the front: {front:?}");
+		assert!(run(&renderer, &SceneCache::default(), &job("Model.Nothing")).is_err(), "an instance with no part is an error");
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

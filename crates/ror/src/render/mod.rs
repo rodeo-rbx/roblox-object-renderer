@@ -104,6 +104,11 @@ pub enum Background {
 	Transparent,
 	/// A flat sRGB colour (0..1).
 	Color([f32; 3]),
+	/// A ViewportFrame's target: cleared to its background, an sRGB colour (0..1) at an opacity (1 -
+	/// BackgroundTransparency), and written as a PNG with straight alpha. Studio averages its samples'
+	/// colours as they are, so a part's edge mixes the clear colour in at full strength whatever its
+	/// opacity, and clips the mean at 1 (notes/render.md "ViewportFrames").
+	Frame { color: [f32; 3], alpha: f32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -825,6 +830,23 @@ fn surface_groups(part: &Part) -> u32 {
 		packed |= group << (4 * face);
 	}
 	packed
+}
+
+/// How a part's material textures and surface types map onto the drawn shape: planar per face on
+/// primitives, projected on balls and meshes, the mesh's own uv without either. Surface types tile the
+/// face's frame also on a Plastic without a texture pack (the pre-2022 Plastic: Studio 0.747 puts its studs
+/// where the 2022 Plastic's are, rur's viewport-models in a place without Use2022Materials; with the mesh's
+/// uv a cylinder's and a ball's studs came out larger and shifted).
+fn uv_mode(flags: u32, is_mesh: bool, geometry: &Geometry, surfaces: u32) -> u32 {
+	if flags & TEX_MATERIAL == 0 && surfaces == 0 {
+		UV_MESH
+	} else if is_mesh {
+		UV_BOX
+	} else if matches!(geometry, Geometry::Ball) {
+		UV_BALL
+	} else {
+		UV_PLANAR
+	}
 }
 
 /// How material textures map onto the drawn shape (`UV_*` in shaders/common.wgsl).
@@ -3006,7 +3028,7 @@ impl Renderer {
 				})
 				.collect();
 			let load = |uri: &&String| self.load_whole(uri, TextureUse::Color).ok();
-			if scene.live || wanted.len() < 2 {
+			if scene.live || wanted.len() < 2 || !crate::par::spread(wanted.len(), 8) {
 				held.extend(wanted.iter().filter_map(load));
 			} else {
 				held.par_extend(wanted.par_iter().filter_map(load));
@@ -3143,7 +3165,7 @@ impl Renderer {
 				}
 			};
 			// as each_part
-			if scene.live {
+			if scene.live || !crate::par::spread(unique.len(), 8) {
 				unique.iter().for_each(load);
 			} else {
 				unique.par_iter().for_each(load);
@@ -3169,7 +3191,7 @@ impl Renderer {
 			Arc::new(self.prepare_part(plain.as_ref().unwrap_or(&scene.parts[position]), mesh, material, flags[position], &context))
 		};
 		// as each_part
-		let prepared: Vec<Arc<prepared::PreparedPart>> = if scene.live { inputs.into_iter().map(&prepare).collect() } else { inputs.into_par_iter().map(&prepare).collect() };
+		let prepared: Vec<Arc<prepared::PreparedPart>> = if scene.live || !crate::par::spread(inputs.len(), CLIP_PARTS) { inputs.into_iter().map(&prepare).collect() } else { inputs.into_par_iter().map(&prepare).collect() };
 		for part in &prepared {
 			stats.missing.extend(part.missing.iter().cloned());
 		}
@@ -3184,10 +3206,12 @@ impl Renderer {
 			self.preparations.keep_parts(table, keep.map(|((position, part), _)| (&key.parts[*position][..], flags[*position], part.clone())));
 		}
 		let moving = !prepared.is_empty() && prepared.len() < scene.parts.len();
-		// which parts a later frame may take as they are (what the kept table takes)
+		// which parts a later frame may take as they are: what the kept table takes, and a skinned part too
+		// (its key holds its pose, and its posed mesh is its own unless the scene is live): a map's 253 tufts
+		// of grass, skinned and never moving, were prepared again every frame of a clip
 		let mut reusable: Vec<bool> = kept.iter().map(Option::is_some).collect();
 		for ((position, part), complete) in fresh.iter().zip(&prepared).zip(&complete) {
-			reusable[*position] = *complete && part.missing.is_empty() && scene.parts[*position].skeleton.is_none();
+			reusable[*position] = *complete && part.missing.is_empty() && (scene.parts[*position].skeleton.is_none() || !scene.live);
 		}
 
 		// the frame's parts in order, each part's instances and draws after those before it: the last
@@ -3429,13 +3453,11 @@ impl Renderer {
 					let head = if mesh_uv { glam::Vec2::new(part.size.x.min(part.size.z), part.size.y).max(glam::Vec2::splat(1e-4)) } else { glam::Vec2::ONE };
 					tiling = [t.studs_per_tile_u / head.x, t.studs_per_tile_v / head.y, t.offset_studs_u / head.x, t.offset_studs_v / head.y];
 				} else if decal.uv_offset != [0.0; 2] || decal.uv_scale != [1.0; 2] {
-					// a Decal's UVOffset and UVScale: its image at (uv + offset) / scale (notes/render.md
-					// "Decals": an effect's rocks and rift walls at (0, 0.5) and (1, 0.75), their
-					// glow rising from the image's bottom edge filling the faces' lower three quarters; a
-					// scale of 0 held off)
+					// a Decal's UVOffset and UVScale: its image at uv * scale + offset (notes/render.md
+					// "Decals": 4-stud blocks with one Front decal, the image at half size in the face's
+					// top-left quarter at scale 2, moved left by a quarter of the face at offset 0.25)
 					decal_flags |= TEX_DECAL_UV;
-					let scale = decal.uv_scale.map(|value| if value.abs() < 1e-4 { 1e-4f32.copysign(value) } else { value });
-					tiling = [scale[0], scale[1], decal.uv_offset[0], decal.uv_offset[1]];
+					tiling = [decal.uv_scale[0], decal.uv_scale[1], decal.uv_offset[0], decal.uv_offset[1]];
 				}
 				let instance_index = instances.len() as u32;
 				let world = part.cframe * local;
@@ -3497,16 +3519,8 @@ impl Renderer {
 			let model = Mat4::from(world);
 			let normal_matrix = Mat4::from_mat3(glam::Mat3::from(world.matrix3).inverse().transpose());
 			let mut flags = flags;
-			// material textures: planar per face on primitives, projected on balls and meshes
-			let uv_mode = if flags & TEX_MATERIAL == 0 {
-				UV_MESH
-			} else if is_mesh {
-				UV_BOX
-			} else if matches!(part.geometry, Geometry::Ball) {
-				UV_BALL
-			} else {
-				UV_PLANAR
-			};
+			let surfaces = if context.surface_maps { surface_groups(part) } else { 0 };
+			let uv_mode = uv_mode(flags, is_mesh, &part.geometry, surfaces);
 			// the drawn shape's size (a ball's diameter, a cylinder's length and diameter); meshes
 			// project onto the part's box
 			let drawn_size = if is_mesh { part.size } else { Vec3::new(local.matrix3.x_axis.length(), local.matrix3.y_axis.length(), local.matrix3.z_axis.length()) };
@@ -3566,7 +3580,7 @@ impl Renderer {
 				color: [base.x, base.y, base.z, opacity],
 				params: [tune_spec().filter(|_| params.metalness == 0.0 && flags & TEX_MATERIAL == 0 && params.shading == materials::SHADING_STANDARD).map(|(roughness, ..)| roughness).unwrap_or(params.roughness), params.metalness, reflectance, emissive],
 				size: [drawn_size.x, drawn_size.y, drawn_size.z, studs_per_tile],
-				flags: [params.shading, flags, if context.surface_maps { surface_groups(part) } else { 0 }, uv_mode],
+				flags: [params.shading, flags, surfaces, uv_mode],
 				// parts: the material texture offset in tiles and the Organic noise's (decals use these for
 				// their tiling)
 				tiling: [offset[0], offset[1], noise_offset[0], noise_offset[1]],
@@ -4240,6 +4254,10 @@ impl Renderer {
 		let (sky_on, background) = match request.background {
 			Background::Sky => (1.0, [0.0, 0.0, 0.0, 1.0]),
 			Background::Transparent => (0.0, [0.0, 0.0, 0.0, 0.0]),
+			Background::Frame { color, alpha } => {
+				let color = linear(Vec3::from(color));
+				(0.0, [color.x, color.y, color.z, alpha.clamp(0.0, 1.0)])
+			}
 			Background::Color(color) => {
 				let color = linear(Vec3::from(color));
 				(0.0, [color.x, color.y, color.z, 1.0])
@@ -4247,7 +4265,7 @@ impl Renderer {
 		};
 		let bodies = self.celestial_bodies(environment, &mut stats.missing);
 		let mut sky_uniform = SkyUniform::zeroed().with(|uniform| {
-			uniform.params = [1.0, sky_on, 0.0, 0.0];
+			uniform.params = [1.0, sky_on, if matches!(request.background, Background::Frame { .. }) { 1.0 } else { 0.0 }, 0.0];
 			uniform.background = background;
 			uniform.sun = bodies.sun;
 			uniform.moon = bodies.moon;
@@ -4594,7 +4612,11 @@ impl Renderer {
 			None => (frame.environment[2], tone_curve(environment)),
 		};
 		let resolve_uniform = ResolveUniform {
-			params: [exposure, tonemapper, supersample as f32, if request.background == Background::Transparent { 1.0 } else { 0.0 }],
+			params: [exposure, tonemapper, supersample as f32, match request.background {
+				Background::Transparent => 1.0,
+				Background::Frame { .. } => 2.0,
+				_ => 0.0,
+			}],
 			correction,
 			tint,
 			bloom: [bloom_weight, bloom_texel, if bloom_on { 1.0 } else { 0.0 }, 0.0],
@@ -5572,12 +5594,19 @@ fn effect_bounds(scene: &Scene, particles: &particles::PreparedParticles) -> Opt
 	})
 }
 
+/// The parts a clip's frame prepares on its own thread ([`crate::par`]): 250 parts prepared again every frame
+/// (a map's skinned tufts of grass, before a skinned part was kept from the last frame) took 1.3 ms there and
+/// as long on the pool's eight threads, which spent 12 ms of CPU on them waiting for the texture cache's lock
+/// and each other.
+const CLIP_PARTS: usize = 1024;
+
 /// `f` of each part of `scene`, in order: on the calling thread for a live scene (`Scene::live`),
 /// across rayon's threads otherwise. A live scene's files are loaded by its first render (or a
 /// prefetch), so each later lookup is a cache hit: handing a character's 51 parts to
 /// rayon's threads took ~0.2 ms a pass against 0.01-0.03 here, its preview's frames 2.2 ms against 1.3.
+/// A clip's frames keep the few parts that changed to their thread too ([`crate::par`]).
 fn each_part<T: Send>(scene: &Scene, f: impl Fn(usize, &Part) -> T + Sync) -> Vec<T> {
-	if scene.live {
+	if scene.live || !crate::par::spread(scene.parts.len(), CLIP_PARTS) {
 		scene.parts.iter().enumerate().map(|(index, part)| f(index, part)).collect()
 	} else {
 		scene.parts.par_iter().enumerate().map(|(index, part)| f(index, part)).collect()
@@ -5586,7 +5615,7 @@ fn each_part<T: Send>(scene: &Scene, f: impl Fn(usize, &Part) -> T + Sync) -> Ve
 
 /// `f` of the parts of `scene` at `positions`, in their order, as [`each_part`].
 fn each_of<T: Send>(scene: &Scene, positions: &[usize], f: impl Fn(usize, &Part) -> T + Sync) -> Vec<T> {
-	if scene.live {
+	if scene.live || !crate::par::spread(positions.len(), CLIP_PARTS) {
 		positions.iter().map(|&index| f(index, &scene.parts[index])).collect()
 	} else {
 		positions.par_iter().map(|&index| f(index, &scene.parts[index])).collect()
@@ -5754,6 +5783,110 @@ mod gate_tests {
 		drop(drawing);
 		let (after, _) = renderer.render(&scene, &views).unwrap();
 		assert!(before.iter().zip(&after).all(|(before, after)| before.rgba == after.rgba), "other pixels once what relieve let go of was made again");
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod decal_uv_tests {
+	use super::*;
+
+	/// A Decal's UVOffset and UVScale map the face's uv to its image's as uv * UVScale + UVOffset (Studio,
+	/// 4-stud blocks with one Front decal at these five pairs): a red square over the middle of an
+	/// otherwise clear image, on an 8-stud plate's front seen head-on, lands where that puts it, the face
+	/// still bounding it.
+	#[test]
+	fn a_decals_uv_offset_and_scale_map_the_face_to_its_image() {
+		let state = std::env::temp_dir().join(format!("ror-decal-uv-test-{}", std::process::id()));
+		std::fs::create_dir_all(&state).unwrap();
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		// a 64-texel image, clear but for an opaque red square from 0.375 to 0.625 on both axes
+		let (side, low, high) = (64u32, 0.375f32, 0.625f32);
+		let inside = |texel: u32| (low..high).contains(&((texel as f32 + 0.5) / side as f32));
+		let rgba: Vec<u8> = (0..side * side).flat_map(|index| if inside(index % side) && inside(index / side) { [255, 0, 0, 255] } else { [0; 4] }).collect();
+		let mut image = ror_image::Image::from_rgba8(side, side, rgba);
+		ror_image::generate_mips_with(&mut image, ror_image::MipFilter::Triangle, true);
+		let path = state.join("square.tex");
+		assert!(texture_files::write(&path, &image, TextureUse::Color));
+		let uri = "rbxassetid://454545";
+		let key = transcode::image_key(uri);
+		let texture = renderer.textures.get_or_load(&(content_key(&key), TextureUse::Color), || texture_files::open(&path, &key).ok_or_else(|| anyhow!("the texture file"))).unwrap();
+		// the plate's front 9.5 studs from the camera: its half width in pixels
+		let (size, distance) = (128u32, 10.0f32);
+		let half = 4.0 / ((distance - 0.5) * 35f32.to_radians().tan()) * size as f32 * 0.5;
+		let face = |pixel: u32| (pixel as f32 + 0.5 - (size as f32 * 0.5 - half)) / (2.0 * half);
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -distance], target: [0.0; 3], fov: 70.0 }, background: Background::Color([0.0; 3]), bloom: false, ..Default::default() };
+		for (offset, scale) in [([0.0, 0.0], [1.0, 1.0]), ([0.0, 0.0], [2.0, 2.0]), ([0.25, 0.0], [1.0, 1.0]), ([0.0, 0.5], [1.0, 0.75]), ([-0.37, -0.22], [1.5, 1.5])] {
+			let mut model = crate::scene::build::ModelBuilder::new("Plate");
+			model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(8.0, 8.0, 1.0), ..Default::default() });
+			let mut scene = crate::scene::extract::extract(&model.into_document());
+			Arc::make_mut(&mut scene.parts[0]).decals.push(crate::scene::Decal { face: 5, texture: uri.into(), color: Vec3::ONE, transparency: 0.0, z_index: 1, tiling: None, uv_offset: offset, uv_scale: scale });
+			let (images, _) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+			// the red pixels' extent in the face's uv (u to the right, v down): min u, min v, max u, max v
+			let mut extent = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+			for (index, pixel) in images[0].rgba.chunks(4).enumerate() {
+				let (red, rest) = (pixel[0] as f32, pixel[1].max(pixel[2]) as f32);
+				if red > 60.0 && red > 2.0 * rest {
+					let (u, v) = (face(index as u32 % size), face(index as u32 / size));
+					extent = [extent[0].min(u), extent[1].min(v), extent[2].max(u), extent[3].max(v)];
+				}
+			}
+			let expected: [f32; 4] = std::array::from_fn(|i| ((if i < 2 { low } else { high } - offset[i % 2]) / scale[i % 2]).clamp(0.0, 1.0));
+			assert!(extent.iter().zip(expected).all(|(got, want)| (got - want).abs() < 0.04), "UVOffset {offset:?} UVScale {scale:?}: the square over {extent:?} of the face, expected {expected:?}");
+		}
+		drop(texture);
+		drop(renderer);
+		let _ = std::fs::remove_dir_all(&state);
+	}
+}
+
+#[cfg(test)]
+mod viewport_frame_tests {
+	use super::*;
+
+	/// Surface types without a material texture (the pre-2022 Plastic) still take the face's frame.
+	#[test]
+	fn surface_types_tile_the_face_frame_without_a_texture_pack() {
+		assert_eq!(uv_mode(0, false, &Geometry::Cylinder, 1 << 4), UV_PLANAR);
+		assert_eq!(uv_mode(0, false, &Geometry::Ball, 1 << 4), UV_BALL);
+		assert_eq!(uv_mode(0, false, &Geometry::Block, 0), UV_MESH);
+		assert_eq!(uv_mode(TEX_MATERIAL, false, &Geometry::Block, 0), UV_PLANAR);
+	}
+
+	/// A ViewportFrame's target (`Background::Frame`) is cleared to the frame's background colour at its
+	/// opacity, and a part's anti-aliased edge averages the part's colour with the clear colour as it is,
+	/// whatever the opacity (Studio 0.747: a white part's edge over a half-transparent background is the
+	/// mean of white and that colour at the mean opacity).
+	#[test]
+	fn a_viewport_frames_target_is_cleared_to_its_background() {
+		let state = std::env::temp_dir().join(format!("ror-viewport-frame-test-{}", std::process::id()));
+		let gpu = Arc::new(Gpu::new().expect("a GPU (or the software adapter)"));
+		let assets = ror_assets::Assets::new(ror_assets::AssetConfig { offline: true, ..ror_assets::AssetConfig::new(&state) });
+		let renderer = Renderer::new(gpu, assets).expect("a renderer");
+		let mut model = crate::scene::build::ModelBuilder::new("Plate");
+		model.part(&crate::scene::build::PartSpec { name: "Plate".into(), size: Vec3::new(4.0, 4.0, 1.0), material: 272, color: [255, 255, 255], ..Default::default() });
+		let mut scene = crate::scene::extract::extract(&model.into_document());
+		scene.in_viewport_frame(crate::scene::environment::ViewportLighting { ambient: Vec3::ONE, light_color: Vec3::ZERO, light_direction: Vec3::NEG_Z, sky: None });
+		let colour = [0.2f32, 0.4, 0.6];
+		let size = 64u32;
+		let request = ViewRequest { width: size, height: size, camera: CameraSpec::LookAt { eye: [0.0, 0.0, -10.0], target: [0.0; 3], fov: 40.0 }, background: Background::Frame { color: colour, alpha: 0.5 }, bloom: false, ..Default::default() };
+		let (images, _) = renderer.render(&scene, std::slice::from_ref(&request)).unwrap();
+		let pixel = |x: u32, y: u32| -> [f32; 4] { let i = ((y * size + x) * 4) as usize; std::array::from_fn(|c| images[0].rgba[i + c] as f32 / 255.0) };
+		let corner = pixel(1, 1);
+		assert!((0..3).all(|c| (corner[c] - colour[c]).abs() < 1.5 / 255.0) && (corner[3] - 0.5).abs() < 1.5 / 255.0, "the clear colour at its opacity: {corner:?}");
+		let middle = pixel(size / 2, size / 2);
+		assert!(middle[3] > 254.0 / 255.0 && middle[0] > 0.9, "the part opaque: {middle:?}");
+		// along the middle row, every pixel the part covers in part: the straight mean, at the mean opacity
+		let row: Vec<[f32; 4]> = (0..size).map(|x| pixel(x, size / 2)).collect();
+		let edges: Vec<&[f32; 4]> = row.iter().filter(|p| p[3] > 0.52 && p[3] < 0.98).collect();
+		assert!(!edges.is_empty(), "an anti-aliased edge");
+		for edge in edges {
+			let covered = (edge[3] - 0.5) / 0.5;
+			let blue = 1.0 * covered + colour[2] * (1.0 - covered);
+			assert!((edge[2] - blue).abs() < 3.0 / 255.0, "the edge's colour is the straight mean ({blue}): {edge:?}");
+		}
 		let _ = std::fs::remove_dir_all(&state);
 	}
 }

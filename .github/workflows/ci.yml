@@ -1,5 +1,9 @@
 # Runs on the public repository only: the private one has no free Actions minutes to spare.
 # Third-party actions are pinned to full commit SHAs; Dependabot (private repo) keeps them current.
+#
+# Nine jobs run side by side (the fork adds the macOS one, first below): one builds the whole workspace, tests the decoding crates and runs Clippy;
+# one runs ror's binary, integration and documentation tests and builds the examples; six share ror's
+# library tests, which are the slow part. Each of those six builds only the library's test binary.
 name: CI
 
 on:
@@ -16,17 +20,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # The fork ships macOS binaries, which upstream's Windows-only jobs never build or test. One job does
+  # all of it on macOS: renders go through Metal; the tests on Windows' memory admission and the capture
+  # Studio build run on Windows only.
+  macos:
     if: ${{ !github.event.repository.private }}
-    name: Build and test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Build, test and Clippy (macos-latest)
+    runs-on: macos-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        # macOS too (the fork): its renders go through Metal, and the tests on Windows' memory
-        # admission and the capture Studio build on Windows only
-        os: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -37,9 +38,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The public build: no GPU on GitHub's Windows runners, so ror's render tests run on the
-      # software adapter (WARP); no Studio install or Roblox client cache, so the tests needing them skip.
       - name: Build
         run: cargo build --release --locked --workspace --all-targets
       - name: Test the decoding and asset crates
@@ -48,3 +48,106 @@ jobs:
         run: cargo test --release --locked -p ror -- --test-threads=1
       - name: Clippy
         run: cargo clippy --release --locked --workspace --all-targets
+
+  workspace:
+    if: ${{ !github.event.repository.private }}
+    name: Build, test the decoding crates and Clippy (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: "1.90.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Its own cache, so the workspace's feature set never replaces the one the ror jobs restore.
+          shared-key: workspace
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        run: cargo build --release --locked --workspace --all-targets
+      - name: Test the decoding and asset crates
+        run: cargo test --release --locked -p ror-image -p ror-mesh -p ror-assets
+      - name: Clippy
+        run: cargo clippy --release --locked --workspace --all-targets
+      # The runner that shares ror's library tests over the jobs below. It needs no build, and runs
+      # after a failed step too.
+      - name: CI tool tests
+        if: ${{ !cancelled() }}
+        run: node --test tools/ci/test.mjs
+
+  # Everything of ror's but its library's unit tests: the binary's tests, the integration tests, the
+  # documentation tests and the examples (which a plain cargo test builds as ordinary programs). The
+  # same package and features as the jobs below (-p ror, the shipped binary's dependency features), so
+  # the two kinds of job share one dependency cache.
+  ror-targets:
+    if: ${{ !github.event.repository.private }}
+    name: Test ror's binary, integration and documentation tests, build the examples (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The library jobs' cache (see below); they store it.
+          shared-key: test
+          save-if: false
+      - name: Build the examples
+        run: cargo build --release --locked -p ror --examples
+      # --test '*' picks every integration test; --tests would add the library's unit tests too
+      - name: Test ror's binary and integration tests
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked --no-fail-fast -p ror --bins --test '*' -- --test-threads=1
+      - name: Test ror documentation
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p ror --doc -- --test-threads=1
+
+  # ror's library tests, split over six runners. They build only the library's test binary, with the
+  # same dependency features as the shipped binary (-p ror): a workspace test run would also switch on
+  # ror-mesh's Draco encoder and rusqlite's hashbrown feature.
+  #
+  # GitHub's runners have no GPU, so the render tests use the software adapter (WARP), which runs faster
+  # with a runner's CPUs to itself. They have no Studio install or Roblox client cache either, so the
+  # tests needing them skip. The render budgets, the GPU state and the environment are shared by every
+  # test in a process, so each runner runs its tests one at a time (--test-threads=1), as before the split.
+  #
+  # Cargo starts the test binary through tools/ci/test-entry.mjs. Its runner (tools/ci/test-shard.mjs)
+  # lists the tests and runs this job's share: fourteen tests that draw on the software adapter take
+  # nearly all of the time, so the shares are cut by the times in tools/ci/test-weights.json, longest
+  # first, each to the job with the least so far. Together the six shares hold every test exactly once.
+  ror:
+    if: ${{ !github.event.repository.private }}
+    name: Test ror's library, part ${{ matrix.part }} of 6 (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only labels the jobs: the runner counts from strategy.job-index (from 0) and job-total
+        part: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # One cache for ror's test jobs, which all build the same features. Only the first library
+          # job stores it, on main: the others would only race it to store the same key.
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' && strategy.job-index == 0 }}
+      # The entry is given by its absolute path, as cargo starts it in the package's folder.
+      - name: Test ror's library (this job's share)
+        run: |
+          $entry = (Resolve-Path tools/ci/test-entry.mjs).Path.Replace('\', '/')
+          cargo test --release --locked --no-fail-fast -p ror --lib --config "target.x86_64-pc-windows-msvc.runner=['node','$entry','${{ strategy.job-index }}','${{ strategy.job-total }}']" -- --test-threads=1

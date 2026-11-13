@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::job::{Lent, SceneCache, ViewResult, input_bytes, input_name};
+use crate::job::{SceneCache, ViewResult, input_bytes, input_name};
 use crate::output;
 use crate::render::camera::CameraSpec;
 use crate::render::guis::FrameGuis;
@@ -164,6 +164,10 @@ pub struct VideoJob {
 	/// Other files made from the same frames while the clip encodes ([`VideoCopy`]): an MP4 clip's.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub copies: Vec<VideoCopy>,
+	/// An MP4 encoded by the GPU's hardware encoder in the process ([`crate::nvenc`]) at this quality and
+	/// ceiling, in place of x264; the clip fails where there is none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub nvenc: Option<crate::nvenc::Rate>,
 	/// The folder a relative local path in the input's content is read from (as
 	/// [`crate::job::Job::relative_to`]).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,34 +309,77 @@ fn nv12_brightness(nv12: &[u8], width: usize, height: usize) -> Brightness {
 	}
 	use rayon::prelude::*;
 	let (luma, chroma) = nv12.split_at(pixels);
-	// bands of rows on the thread pool: whole-number sums, so the same however the rows are split
+	// bands of rows, on the thread pool unless a clip's own thread measures: whole-number sums, so the same
+	// however the rows are split
 	const BAND: usize = 64;
-	let (sum, bright, near_white) = luma
-		.par_chunks(width * BAND)
-		.enumerate()
-		.map(|(band, rows)| {
-			let (mut sum, mut bright, mut near_white) = (0u64, 0u64, 0u64);
-			for (offset, line) in rows.chunks_exact(width).enumerate() {
-				let row = band * BAND + offset;
-				// u32 sums of a row cannot overflow below 18 million pixels across
-				let (mut total, mut lit, mut light) = (0u32, 0u32, 0u32);
-				for &y in line {
-					total += y.clamp(16, 235) as u32;
-					lit += (y >= BRIGHT_Y) as u32;
-					light += (y >= NEAR_WHITE_Y) as u32;
-				}
-				(sum, bright) = (sum + total as u64, bright + lit as u64);
-				// only rows with a pixel light enough are decoded
-				if light > 0 {
-					let pairs = &chroma[row / 2 * width..(row / 2 + 1) * width];
-					near_white += line.iter().enumerate().filter(|&(column, &y)| y >= NEAR_WHITE_Y && near_white_yuv(y, pairs[column & !1], pairs[column | 1])).count() as u64;
-				}
-			}
-			(sum, bright, near_white)
-		})
-		.reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+	let measure = |(band, rows): (usize, &[u8])| {
+		let (mut sum, mut bright, mut near_white) = (0u64, 0u64, 0u64);
+		for (offset, line) in rows.chunks_exact(width).enumerate() {
+			let row = band * BAND + offset;
+			let pairs = &chroma[row / 2 * width..(row / 2 + 1) * width];
+			let (total, lit, white) = row_levels(line, pairs);
+			(sum, bright, near_white) = (sum + total, bright + lit, near_white + white);
+		}
+		(sum, bright, near_white)
+	};
+	let add = |a: (u64, u64, u64), b: (u64, u64, u64)| (a.0 + b.0, a.1 + b.1, a.2 + b.2);
+	let (sum, bright, near_white) = if crate::par::spread(0, usize::MAX) {
+		luma.par_chunks(width * BAND).enumerate().map(measure).reduce(|| (0, 0, 0), add)
+	} else {
+		luma.chunks(width * BAND).enumerate().map(measure).fold((0, 0, 0), add)
+	};
 	let mean = sum as f64 / pixels as f64;
 	Brightness { near_white, bright, luma: ((mean - 16.0) / 219.0).clamp(0.0, 1.0) }
+}
+
+/// A row of luma's sum (each pixel within 16-235), its pixels at least [`BRIGHT_Y`] and those near white
+/// ([`near_white_yuv`] with the row's chroma `pairs`; only pixels light enough are decoded).
+fn row_levels_plain(line: &[u8], pairs: &[u8], from: usize) -> (u64, u64, u64) {
+	let (mut total, mut lit, mut white) = (0u64, 0u64, 0u64);
+	for (column, &y) in line.iter().enumerate().skip(from) {
+		total += y.clamp(16, 235) as u64;
+		lit += (y >= BRIGHT_Y) as u64;
+		white += (y >= NEAR_WHITE_Y && near_white_yuv(y, pairs[column & !1], pairs[column | 1])) as u64;
+	}
+	(total, lit, white)
+}
+
+/// [`row_levels_plain`] sixteen pixels at a time: a 1440p frame's 3.7 million took 1.25 ms one by one on
+/// the thread that hands the frame to the encoder, a third of that thread's time.
+#[cfg(target_arch = "x86_64")]
+fn row_levels(line: &[u8], pairs: &[u8]) -> (u64, u64, u64) {
+	use std::arch::x86_64::*;
+	let blocks = line.len() / 16;
+	let mut white = 0u64;
+	// SAFETY: SSE2 is part of x86_64; each load reads 16 bytes inside `line`
+	let (total, lit) = unsafe {
+		let (zero, one) = (_mm_setzero_si128(), _mm_set1_epi8(1));
+		let (low, high) = (_mm_set1_epi8(16), _mm_set1_epi8(235u8 as i8));
+		let (bright, light) = (_mm_set1_epi8(BRIGHT_Y as i8), _mm_set1_epi8(NEAR_WHITE_Y as i8));
+		let (mut total, mut lit) = (zero, zero);
+		for block in 0..blocks {
+			let pixels = _mm_loadu_si128(line.as_ptr().add(block * 16).cast());
+			total = _mm_add_epi64(total, _mm_sad_epu8(_mm_min_epu8(_mm_max_epu8(pixels, low), high), zero));
+			// unsigned y >= level: the larger of the two is y
+			let is_bright = _mm_cmpeq_epi8(_mm_max_epu8(pixels, bright), pixels);
+			lit = _mm_add_epi64(lit, _mm_sad_epu8(_mm_and_si128(is_bright, one), zero));
+			let mut is_light = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(pixels, light), pixels)) as u32;
+			while is_light != 0 {
+				let column = block * 16 + is_light.trailing_zeros() as usize;
+				white += near_white_yuv(line[column], pairs[column & !1], pairs[column | 1]) as u64;
+				is_light &= is_light - 1;
+			}
+		}
+		let lanes = |sums: __m128i| _mm_cvtsi128_si64(sums) as u64 + _mm_cvtsi128_si64(_mm_unpackhi_epi64(sums, sums)) as u64;
+		(lanes(total), lanes(lit))
+	};
+	let rest = row_levels_plain(line, pairs, blocks * 16);
+	(total + rest.0, lit + rest.1, white + rest.2)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn row_levels(line: &[u8], pairs: &[u8]) -> (u64, u64, u64) {
+	row_levels_plain(line, pairs, 0)
 }
 
 /// Whether a limited-range BT.709 pixel decodes to red, green and blue all at least 229.5 of 255
@@ -399,10 +446,24 @@ struct Census {
 
 impl Census {
 	fn add(&mut self, scene: &Scene) {
-		self.parts.add(scene.parts.iter().map(|part| part.path.as_str()));
-		self.emitters.add(scene.particles.iter().map(|emitter| emitter.path.as_str()));
-		self.beams.add(scene.beams.iter().map(|beam| beam.path.as_str()));
-		self.trails.add(scene.trails.iter().map(|trail| trail.path.as_str()));
+		self.add_after(scene, None);
+	}
+
+	/// [`Census::add`] of the frame after `last`'s, both counted here: a kind whose paths are the last
+	/// frame's in the same order adds nothing (a map clip hashed its 2,100 part paths every frame, 0.55 ms).
+	fn add_after(&mut self, scene: &Scene, last: Option<&Scene>) {
+		fn paths<'a, T: 'a>(items: &'a [T], path: fn(&T) -> &str) -> impl Iterator<Item = &'a str> + Clone {
+			items.iter().map(path)
+		}
+		fn add<'a, T: 'a>(copies: &mut Copies, items: &'a [T], last: Option<&'a [T]>, path: fn(&T) -> &str) {
+			if !last.is_some_and(|last| last.len() == items.len() && paths(last, path).eq(paths(items, path))) {
+				copies.add(paths(items, path));
+			}
+		}
+		add(&mut self.parts, &scene.parts, last.map(|last| &last.parts[..]), |part| part.path.as_str());
+		add(&mut self.emitters, &scene.particles, last.map(|last| &last.particles[..]), |emitter| emitter.path.as_str());
+		add(&mut self.beams, &scene.beams, last.map(|last| &last.beams[..]), |beam| beam.path.as_str());
+		add(&mut self.trails, &scene.trails, last.map(|last| &last.trails[..]), |trail| trail.path.as_str());
 	}
 
 	/// (parts, emitters, beams, trails)
@@ -764,8 +825,8 @@ struct Builder<'a> {
 	map: Option<&'a crate::job::MapSetting>,
 	/// Another place's MaterialService and Lighting (the map's own unless others are named)
 	lend: (Option<&'a str>, Option<&'a str>),
-	/// That place's Lighting as the documents were given it, for a playback that changes it
-	lent: Option<Lent>,
+	/// Whether the documents hold that place's Lighting and Terrain's Clouds, for a playback that changes them
+	lent: bool,
 	/// What every moment draws, extracted once with its document, for a playback that changes no
 	/// property (`fixed`) or only the Lighting (`lit`: each moment reads the Lighting of a copy of
 	/// that document, changed, into it; the copies keep its referents, which the scene names)
@@ -793,7 +854,7 @@ impl<'a> Builder<'a> {
 			relative_to: job.relative_to.as_deref(),
 			map: job.map.as_ref(),
 			lend: scenes.lenders(job.map.as_ref(), job.materials_from.as_deref(), job.lighting_from.as_deref())?,
-			lent: None,
+			lent: false,
 			fixed: None,
 			lit: None,
 			documents: Mutex::new(Vec::new()),
@@ -833,7 +894,7 @@ impl<'a> Builder<'a> {
 	}
 
 	/// The input as a document, with the map drawn around it and the Lighting the playback changes.
-	fn document(&self) -> Result<(Document, Option<Lent>)> {
+	fn document(&self) -> Result<(Document, bool)> {
 		let mut document = scene::load::read_bytes(&self.bytes)?;
 		document.play = self.playback.play;
 		document.salt = self.playback.salt.clone();
@@ -883,13 +944,7 @@ impl<'a> Builder<'a> {
 
 	/// The other places' MaterialService and Lighting (unless the documents carry that Lighting).
 	fn finish(&self, scene: &mut Scene) -> Result<()> {
-		match &self.lent {
-			Some(lent) => {
-				lent.finish(scene);
-				self.scenes.lend(scene, self.lend.0, None)
-			}
-			None => self.scenes.lend(scene, self.lend.0, self.lend.1),
-		}
+		self.scenes.lend(scene, self.lend.0, self.lend.1.filter(|_| !self.lent))
 	}
 
 	/// The scene `time` seconds after the playback's start, on a document of its own.
@@ -948,9 +1003,6 @@ impl<'a> Builder<'a> {
 				let mut scene = base.clone();
 				if self.playback.touches_lighting() {
 					scene.environment = scene::extract::environment(&document).unwrap_or_default();
-					if let Some(lent) = &self.lent {
-						lent.finish(&mut scene);
-					}
 				}
 				scene
 			}
@@ -1004,26 +1056,31 @@ impl<'a> Builder<'a> {
 		std::thread::scope(|scope| {
 			let (mut helpers, mut unblocked) = (0, 0);
 			let most = rayon::current_num_threads().clamp(2, 16) - 1;
+			let mut second = f64::INFINITY;
 			for index in 0..times.len() {
 				let started = Instant::now();
 				let built = ahead.take(index, &build);
-				// a slow second frame (the first reads the untouched roots once): helpers from now, as
+				// slow second and third frames (the first reads the untouched roots once, and the second
+				// alone may still settle: an attack clip's took 12 ms, its others 2.4): helpers from now, as
 				// many as it takes for scenes to come about as fast as the draws take them, rather than
 				// one at a time each after the draws ran dry (a 5,053-part map sim's frames take ~25 ms to
 				// make, a helper's own document ~130 ms before its first)
-				if index == 1 && helpers == 0 {
-					let ms = started.elapsed().as_secs_f64() * 1000.0;
+				if index == 1 {
+					second = started.elapsed().as_secs_f64() * 1000.0;
+				}
+				if index == 2 && helpers == 0 {
+					let ms = second.min(started.elapsed().as_secs_f64() * 1000.0);
 					let (free, others) = (crate::available_memory(), PRODUCING.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1));
 					let roomy = others == 0 && free.is_some_and(|free| free > EARLY_HELPERS_FREE);
 					if std::env::var_os("ROR_PROFILE").is_some() {
-						eprintln!("profile: the producer's second frame {ms:.1} ms; {} GB free, {others} other clips making scenes: {}", free.map_or(0, |free| free >> 30), if roomy { "helpers now" } else { "helpers only as the draws wait" });
+						eprintln!("profile: the producer's second and third frames {ms:.1} ms or more; {} GB free, {others} other clips making scenes: {}", free.map_or(0, |free| free >> 30), if roomy { "helpers now" } else { "helpers only as the draws wait" });
 					}
 					if ms > EARLY_HELPERS_FROM_MS && roomy {
 						for _ in 0..((ms / EARLY_HELPERS_FROM_MS).ceil() as usize).min(EARLY_HELPERS).min(most) {
 							let Some(slot) = HelperSlot::take(most) else { break };
 							helpers += 1;
 							scope.spawn(|| {
-								let _slot = slot;
+								let (_slot, _clip) = (slot, crate::par::ClipThread::enter());
 								ahead.help(&build)
 							});
 						}
@@ -1049,7 +1106,7 @@ impl<'a> Builder<'a> {
 					helpers += 1;
 					unblocked = 0;
 					scope.spawn(|| {
-						let _slot = slot;
+						let (_slot, _clip) = (slot, crate::par::ClipThread::enter());
 						ahead.help(&build)
 					});
 				}
@@ -1232,8 +1289,8 @@ const FOUND_FRAMES: usize = 4;
 /// Scenes made ahead of the GUI stage: as many as it finds together for a clip with GUIs, a few
 /// otherwise (each cosmetic's 2-3 MB; the producer outpaces the draws).
 const SCENES_AHEAD: usize = 4;
-/// A clip's second frame taking longer than this to make starts a helper for every such stretch of its
-/// time, up to [`EARLY_HELPERS`] ([`Builder::produce`]): a cosmetic's take 2-4 ms and start none.
+/// A clip's second and third frames both taking longer than this to make start a helper for every such
+/// stretch of the quicker one's time, up to [`EARLY_HELPERS`] ([`Builder::produce`]): a cosmetic's take 2-4 ms and start none.
 /// Only with more than [`EARLY_HELPERS_FREE`] of memory free and no other clip making scenes in this
 /// process: their documents sooner cost a map sim ~200 MB more at its peak.
 const EARLY_HELPERS_FROM_MS: f64 = 8.0;
@@ -1515,6 +1572,7 @@ fn follow_playback<'s>(builder: &'s Builder, held: &Mutex<Vec<Kept<'s>>>, job: &
 enum Encoder {
 	#[cfg(ror_x264)]
 	X264 { encoder: crate::x264::Encoder, mp4: crate::mp4::Mp4Writer, sei: Vec<u8>, temporary: PathBuf, target: PathBuf },
+	Nvenc { encoder: crate::nvenc::Encoder, mp4: crate::mp4::Mp4Writer, temporary: PathBuf, target: PathBuf },
 	Ffmpeg { child: std::process::Child, input: Option<std::fs::File>, errors: std::thread::JoinHandle<String>, temporary: PathBuf, target: PathBuf, name: String, nv12: bool },
 	Apng { writer: Box<png::Writer<std::io::BufWriter<std::fs::File>>>, temporary: PathBuf, target: PathBuf },
 	Frames { dir: PathBuf, width: u32, height: u32 },
@@ -1545,6 +1603,10 @@ impl Drop for EncoderStarted {
 			}
 			#[cfg(ror_x264)]
 			Some(Encoder::X264 { encoder, mp4, temporary, .. }) => {
+				drop((encoder, mp4));
+				let _ = std::fs::remove_file(&temporary);
+			}
+			Some(Encoder::Nvenc { encoder, mp4, temporary, .. }) => {
 				drop((encoder, mp4));
 				let _ = std::fs::remove_file(&temporary);
 			}
@@ -1717,6 +1779,7 @@ impl Encoder {
 		match self {
 			#[cfg(ror_x264)]
 			Encoder::X264 { .. } => "x264".into(),
+			Encoder::Nvenc { .. } => "nvenc".into(),
 			Encoder::Ffmpeg { name, .. } => name.clone(),
 			Encoder::Apng { .. } => "apng".into(),
 			Encoder::Frames { .. } => "png".into(),
@@ -1728,13 +1791,23 @@ impl Encoder {
 		match self {
 			#[cfg(ror_x264)]
 			Encoder::X264 { .. } => true,
+			Encoder::Nvenc { .. } => true,
 			Encoder::Ffmpeg { nv12, .. } => *nv12,
 			_ => false,
 		}
 	}
 
-	fn new(format: VideoFormat, ffmpeg: Option<&Path>, out: &Path, (width, height): (u32, u32), fps: f32, frames: usize) -> Result<Encoder> {
+	fn new(format: VideoFormat, ffmpeg: Option<&Path>, out: &Path, (width, height): (u32, u32), fps: f32, frames: usize, nvenc: Option<crate::nvenc::Rate>) -> Result<Encoder> {
 		match format {
+			VideoFormat::Mp4 if nvenc.is_some() => {
+				let target = out.join(format.file_name());
+				let temporary = target.with_extension(format!("tmp{}", std::process::id()));
+				let rate = crate::mp4::frame_rate(fps);
+				let mut encoder = crate::nvenc::Encoder::open(&crate::nvenc::Settings { width, height, fps: rate, rate: nvenc.expect("checked") })?;
+				let headers = encoder.headers()?;
+				let mp4 = crate::mp4::Mp4Writer::create(&temporary, width, height, rate, &headers.sps, &headers.pps, frames, "ror nvenc", true)?;
+				Ok(Encoder::Nvenc { encoder, mp4, temporary, target })
+			}
 			VideoFormat::Png => {
 				let dir = out.join(format.file_name());
 				if dir.is_dir() {
@@ -1764,7 +1837,7 @@ impl Encoder {
 				let settings = crate::x264::Settings { width, height, fps: rate, preset: X264_PRESET.into(), crf: X264_CRF, threads: x264_threads(width, height) };
 				let mut encoder = crate::x264::Encoder::open(&settings)?;
 				let headers = encoder.headers()?;
-				let mp4 = crate::mp4::Mp4Writer::create(&temporary, width, height, rate, &headers.sps, &headers.pps, frames)?;
+				let mp4 = crate::mp4::Mp4Writer::create(&temporary, width, height, rate, &headers.sps, &headers.pps, frames, "ror x264", false)?;
 				Ok(Encoder::X264 { encoder, mp4, sei: headers.sei, temporary, target })
 			}
 			_ => {
@@ -1819,10 +1892,10 @@ impl Encoder {
 		let mut kept = Vec::new();
 		let mut brightness = Vec::new();
 		let (tile_width, tile_height) = thumbnail_size(width, height);
-		#[cfg(ror_x264)]
-		let nv12 = matches!(&self, Encoder::Ffmpeg { nv12: true, .. } | Encoder::X264 { .. });
-		#[cfg(not(ror_x264))]
-		let nv12 = matches!(&self, Encoder::Ffmpeg { nv12: true, .. });
+		let nv12 = self.takes_nv12();
+		// NVENC takes a frame in the time of a copy: its thread measures the frame itself, where x264's
+		// hands that to the pool to encode meanwhile
+		let inline = matches!(&self, Encoder::Nvenc { .. }) && copies.is_empty();
 		// the last drawn frame's pixels, while a frame may repeat it
 		let mut held: Option<crate::render::Held<'r>> = None;
 		let mut consume = |frame: OutputFrame<'r>, write: &mut dyn FnMut(&[u8], &mut OutputProfile) -> Result<()>| -> Result<()> {
@@ -1855,24 +1928,36 @@ impl Encoder {
 				// takes it: on this thread they held up the next frame (a 1440p clip's brightness took
 				// 0.93 ms a frame, 234 of its 564 ms, with a free encoder no less)
 				let (mut measured, mut thumbnail, mut measure_ms, mut thumbnail_ms) = (Brightness::default(), None, 0.0, 0.0);
-				let written = rayon::in_place_scope(|scope| {
-					scope.spawn(|_| {
-						let started = Instant::now();
-						measured = if nv12 { nv12_brightness(pixels, width as usize, height as usize) } else { rgba_brightness(pixels) };
-						measure_ms = started.elapsed().as_secs_f64() * 1000.0;
-					});
+				let written = if inline {
+					let started = Instant::now();
+					measured = nv12_brightness(pixels, width as usize, height as usize);
+					measure_ms = started.elapsed().as_secs_f64() * 1000.0;
 					if let Some(rgba) = sheet {
-						scope.spawn(|_| {
-							let started = Instant::now();
-							thumbnail = Some(downscale(rgba, width, height, tile_width, tile_height));
-							thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
-						});
-					}
-					if !copies.is_empty() {
-						scope.spawn(|_| copies.write(pixels));
+						let started = Instant::now();
+						thumbnail = Some(downscale(rgba, width, height, tile_width, tile_height));
+						thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
 					}
 					write(pixels, &mut profile)
-				});
+				} else {
+					rayon::in_place_scope(|scope| {
+						scope.spawn(|_| {
+							let started = Instant::now();
+							measured = if nv12 { nv12_brightness(pixels, width as usize, height as usize) } else { rgba_brightness(pixels) };
+							measure_ms = started.elapsed().as_secs_f64() * 1000.0;
+						});
+						if let Some(rgba) = sheet {
+							scope.spawn(|_| {
+								let started = Instant::now();
+								thumbnail = Some(downscale(rgba, width, height, tile_width, tile_height));
+								thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
+							});
+						}
+						if !copies.is_empty() {
+							scope.spawn(|_| copies.write(pixels));
+						}
+						write(pixels, &mut profile)
+					})
+				};
 				profile.measure_ms += measure_ms;
 				profile.thumbnail_ms += thumbnail_ms;
 				if let (Some(index), Some(thumbnail)) = (sheet_index, thumbnail) {
@@ -1940,6 +2025,33 @@ impl Encoder {
 				}
 				std::fs::rename(&temporary, &target).with_context(|| format!("writing {}", target.display()))?;
 				"x264".into()
+			}
+			Encoder::Nvenc { mut encoder, mut mp4, temporary, target } => {
+				let written = (|| -> Result<()> {
+					for frame in receiver {
+						consume(frame, &mut |nv12, profile| {
+							let started = Instant::now();
+							encoder.send(nv12)?;
+							while let Some(packet) = encoder.receive()? {
+								mp4.write_at(packet.data, packet.keyframe, packet.display)?;
+							}
+							profile.pipe_ms += started.elapsed().as_secs_f64() * 1000.0;
+							Ok(())
+						})?;
+					}
+					encoder.finish()?;
+					while let Some(packet) = encoder.receive()? {
+						mp4.write_at(packet.data, packet.keyframe, packet.display)?;
+					}
+					drop(encoder);
+					mp4.finish()
+				})();
+				if let Err(error) = written {
+					let _ = std::fs::remove_file(&temporary);
+					return Err(error);
+				}
+				std::fs::rename(&temporary, &target).with_context(|| format!("writing {}", target.display()))?;
+				"nvenc".into()
 			}
 			Encoder::Frames { dir, width, height } => {
 				for (index, frame) in receiver.into_iter().enumerate() {
@@ -2168,7 +2280,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 	let _ = std::fs::remove_file(out.join(FAILED_FILE));
 	// started now, while the input loads and the camera is fitted (its process's start, a cold
 	// executable's first launch among it, off the clip's path); let go of if the clip fails first
-	let encoder = EncoderStarted(Some(Encoder::new(format, ffmpeg.as_deref(), &out, (view.width, view.height), job.fps, count)?));
+	let encoder = EncoderStarted(Some(Encoder::new(format, ffmpeg.as_deref(), &out, (view.width, view.height), job.fps, count, job.nvenc)?));
 	let copies = if job.copies.is_empty() || encoder.0.as_ref().is_some_and(Encoder::takes_nv12) {
 		CopyRuns::start(&job.copies, ffmpeg.as_deref(), (view.width, view.height), job.fps)?
 	} else {
@@ -2291,12 +2403,22 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		let (builder, held) = (&builder, &held);
 		let times_ref = &times;
 		let (view_ref, cameras_ref) = (&view, &cameras);
-		scope.spawn(move || builder.produce(renderer, times_ref, held, batch_sender));
-		scope.spawn(move || find_guis(renderer, view_ref, cameras_ref, batch_receiver, found_sender));
-		scope.spawn(move || upload_guis(renderer, found_receiver, scene_sender));
+		scope.spawn(move || {
+			let _clip = crate::par::ClipThread::enter();
+			builder.produce(renderer, times_ref, held, batch_sender)
+		});
+		scope.spawn(move || {
+			let _clip = crate::par::ClipThread::enter();
+			find_guis(renderer, view_ref, cameras_ref, batch_receiver, found_sender)
+		});
+		scope.spawn(move || {
+			let _clip = crate::par::ClipThread::enter();
+			upload_guis(renderer, found_receiver, scene_sender)
+		});
 		let size = (view.width, view.height);
 		let encoding = scope.spawn(move || {
 			thread_below_normal();
+			let _clip = crate::par::ClipThread::enter();
 			encoder.consume(frame_receiver, size, copies)
 		});
 		// the authoring lints and effects' counts, and dropping each frame's scene, off the drawing
@@ -2304,12 +2426,14 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		let (lint_sender, lint_receiver) = sync_channel::<Scene>(2);
 		let linting = scope.spawn(move || {
 			let (mut motion, mut census, mut effects) = (crate::lint::Motion::default(), Census::default(), crate::lint::Effects::default());
+			let mut last: Option<Scene> = None;
 			for scene in lint_receiver {
 				// they read the model, not a map around it
 				let subject = scene.framing_subject();
 				motion.add(subject.as_ref().unwrap_or(&scene));
-				census.add(&scene);
+				census.add_after(&scene, last.as_ref());
 				effects.add(subject.as_ref().unwrap_or(&scene));
+				last = Some(scene);
 			}
 			(motion, census, effects)
 		});
@@ -2317,6 +2441,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 		let clip_kept = crate::render::ClipKept::new();
 		let reuse = frame_reuse();
 		let drawn = (|| -> Result<()> {
+			let _clip = crate::par::ClipThread::enter();
 			let mut scene_start = Instant::now();
 			// the frame before's scene while the next may repeat it (to the lints once it is compared), and
 			// whether the encoder kept its pixels
@@ -2408,6 +2533,7 @@ fn run_admitted(renderer: &Renderer, scenes: &SceneCache, job: &VideoJob, gpu: O
 						fov: image.camera.fov,
 						near: image.camera.near,
 						lod: image.lod.clone(),
+						alone: None,
 					});
 				}
 				let encoder_start = Instant::now();
@@ -2552,7 +2678,7 @@ fn sheet_first<'s>(renderer: &Renderer, builder: &'s Builder, held: &Mutex<Vec<K
 		let pending = images.pop().context("the render gave no image")?;
 		if first.view.is_none() {
 			let image = pending.image();
-			first.view = Some(ViewResult { name: String::new(), file: None, ids_file: None, width: image.width, height: image.height, camera: image.camera.cframe_components(), fov: image.camera.fov, near: image.camera.near, lod: image.lod.clone() });
+			first.view = Some(ViewResult { name: String::new(), file: None, ids_file: None, width: image.width, height: image.height, camera: image.camera.cframe_components(), fov: image.camera.fov, near: image.camera.near, lod: image.lod.clone(), alone: None });
 		}
 		first.particles.push(frame_stats.particles);
 		for missing in frame_stats.missing {
@@ -2767,6 +2893,7 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let builder = Builder::new(|| Ok(bytes.clone()), &job, &scenes).unwrap();
@@ -2780,6 +2907,86 @@ mod tests {
 		let late = builder.scene_at(0.9).unwrap();
 		assert!(held.is_some() && emits(&late));
 		assert!(late.environment.exposure_compensation < early.environment.exposure_compensation);
+	}
+
+	/// A recording's writes to the Terrain's Clouds (target `Workspace.Terrain.Clouds`) play on the
+	/// clouds ror draws, frame by frame: the stage's (`--lighting-from`) when there is one, else none
+	/// until the playback switches them on. A playback that changes only the Lighting keeps the stage's.
+	#[test]
+	fn a_clip_plays_the_terrain_clouds_on_the_stages() {
+		use crate::scene::build::{ModelBuilder, PartSpec};
+		use rbx_dom_weak::{InstanceBuilder, WeakDom, types::Color3};
+		let folder = std::env::temp_dir().join(format!("ror-terrain-clouds-{}", std::process::id()));
+		std::fs::create_dir_all(&folder).unwrap();
+		let mut place = WeakDom::new(InstanceBuilder::new("DataModel"));
+		let root = place.root_ref();
+		let workspace = place.insert(root, InstanceBuilder::new("Workspace").with_name("Workspace"));
+		let terrain = place.insert(workspace, InstanceBuilder::new("Terrain").with_name("Terrain"));
+		let stage_clouds = InstanceBuilder::new("Clouds").with_name("Clouds").with_property("Cover", 0.84f32).with_property("Density", 0.03f32).with_property("Color", Color3::new(2.5, 3.49, 4.98)).with_property("Enabled", true);
+		place.insert(terrain, stage_clouds);
+		let lighting = place.insert(root, InstanceBuilder::new("Lighting").with_name("Lighting"));
+		let stage = folder.join("stage.rbxl");
+		let mut bytes = Vec::new();
+		rbx_binary::to_writer(&mut bytes, &place, &[workspace, lighting]).unwrap();
+		std::fs::write(&stage, bytes).unwrap();
+		let stage = stage.display().to_string();
+		let mut model = ModelBuilder::new("Model");
+		model.part(&PartSpec::default());
+		let bytes = model.to_rbxm().unwrap();
+		let job = |playback: serde_json::Value, lighting_from: Option<&str>| VideoJob {
+			input: "model.rbxm".into(),
+			select: None,
+			out: None,
+			view: ViewRequest::default(),
+			name: default_name(),
+			playback: Some(serde_json::from_value(playback).unwrap()),
+			playback_file: None,
+			start: 0.0,
+			duration: 1.0,
+			fps: 10.0,
+			speed: 1.0,
+			times: None,
+			orbit: 0.0,
+			format: VideoFormat::Png,
+			sheet: 0,
+			materials_from: None,
+			lighting_from: lighting_from.map(str::to_string),
+			map: None,
+			frame: None,
+			focus: None,
+			ffmpeg: None,
+			camera_track: None,
+			sheet_first: false,
+			copies: Vec::new(),
+			relative_to: None,
+			nvenc: None,
+		};
+		let scenes = SceneCache::default();
+		let clouds_at = |job: &VideoJob, times: &[f32]| -> Vec<Option<crate::scene::environment::Clouds>> {
+			let builder = Builder::new(|| Ok(bytes.clone()), job, &scenes).unwrap();
+			assert!(builder.lit.is_some(), "only the look changes: one scene for the clip");
+			times.iter().map(|&time| builder.scene_at(time).unwrap().environment.clouds).collect()
+		};
+		let storm = serde_json::json!({
+			"play": true,
+			"actions": [{"at": 0, "target": "Workspace.Terrain.Clouds", "set": {"Color": [0.27451, 0.2902, 0.3451]}}],
+			"tweens": [{"target": "Workspace.Terrain.Clouds", "property": "Cover", "keys": [{"at": 0, "value": 0.95}, {"at": 1, "value": 0.84}]}],
+		});
+		let storm = clouds_at(&job(storm, Some(&stage)), &[0.0, 0.5, 1.0]);
+		let [start, middle, end] = [storm[0].unwrap(), storm[1].unwrap(), storm[2].unwrap()];
+		assert!((start.cover - 0.95).abs() < 1e-4 && (end.cover - 0.84).abs() < 1e-4 && middle.cover < start.cover && middle.cover > end.cover, "{storm:?}");
+		assert!(start.color.abs_diff_eq(Vec3::new(0.27451, 0.2902, 0.3451), 1e-4) && end.color == start.color, "{storm:?}");
+		assert!((start.density - 0.03).abs() < 1e-6, "the stage's own Density stays: {storm:?}");
+		// the Lighting alone: the stage's clouds as they are
+		let dim = serde_json::json!({"tweens": [{"target": "Lighting", "property": "ExposureCompensation", "keys": [{"at": 0, "value": 0}, {"at": 1, "value": -1}]}]});
+		let dim = clouds_at(&job(dim, Some(&stage)), &[0.5]);
+		assert_eq!(dim[0].map(|clouds| (clouds.cover, clouds.density, clouds.color)), Some((0.84, 0.03, Vec3::new(2.5, 3.49, 4.98))));
+		// no stage: ror's default environment draws none until the playback switches them on
+		let own = serde_json::json!({"actions": [{"at": 0, "target": "Workspace.Terrain.Clouds", "set": {"Cover": 0.9}}, {"at": 0.5, "target": "Workspace.Terrain.Clouds", "set": {"Enabled": true}}]});
+		let own = clouds_at(&job(own, None), &[0.2, 0.7]);
+		assert!(own[0].is_none(), "{own:?}");
+		assert_eq!(own[1].map(|clouds| (clouds.cover, clouds.density, clouds.color)), Some((0.9, 0.7, Vec3::ONE)));
+		let _ = std::fs::remove_dir_all(&folder);
 	}
 
 	#[test]
@@ -2832,19 +3039,25 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let builder = Builder::new(|| Ok(bytes.clone()), &job, &scenes).unwrap();
 		let first = builder.scene_at(0.0).unwrap();
 		assert_eq!((first.parts.len(), first.particles.len(), first.beams.len()), (1, 0, 0), "the effect is out of the world at first");
 		let mut census = Census::default();
+		// each frame after the last, as a clip counts them: the same counts
+		let (mut after, mut last) = (Census::default(), None);
 		let mut effects = crate::lint::Effects::default();
 		for time in [0.0, 0.3, 0.6, 0.9, 0.95] {
 			let scene = builder.scene_at(time).unwrap();
 			census.add(&scene);
+			after.add_after(&scene, last.as_ref());
 			effects.add(&scene);
+			last = Some(scene);
 		}
 		assert_eq!(census.counts(), (2, 3, 1, 0), "the floor and the holder, the three emitters (copies apart), the beam; each once");
+		assert_eq!(after.counts(), census.counts());
 		// the effect's own counts alike (the floor holds none)
 		let counts = effects.counts(&builder.roots);
 		assert_eq!(counts.effects.iter().map(|effect| (effect.root.as_str(), effect.emitters, effect.beams)).collect::<Vec<_>>(), [("Link.Effect", 3, 1)]);
@@ -2891,6 +3104,7 @@ mod tests {
 			sheet_first,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let plain = run(&renderer, &scenes, &job("plain", true), None).unwrap();
@@ -2962,6 +3176,7 @@ mod tests {
 				VideoCopy { file: bad.clone(), args: ["-c:v", "no_such_encoder"].map(String::from).to_vec() },
 			],
 			relative_to: None,
+			nvenc: None,
 		};
 		let result = run(&renderer, &SceneCache::default(), &job, None).unwrap();
 		assert!(result.video.is_file(), "the clip is written whatever its copies do");
@@ -3033,6 +3248,7 @@ mod tests {
 			sheet_first: false,
 			copies: Vec::new(),
 			relative_to: None,
+			nvenc: None,
 		};
 		let scenes = SceneCache::default();
 		let read = |dir: &str, frame: usize| std::fs::read(state.join(dir).join(format!("frames/{frame:04}.png"))).unwrap();
@@ -3203,6 +3419,19 @@ mod tests {
 		let grey = |level: u8| nv12_brightness(&crate::render::nv12::from_rgba(&[level, level, level, 255].repeat(16), 4, 4, true), 4, 4).near_white;
 		assert_eq!((grey(229), grey(230)), (0, 16));
 		assert_eq!(nv12_brightness(&[0; 5], 2, 2), Brightness::default(), "a short buffer measures nothing");
+		// sixteen at a time counts what one at a time does, at every level and with a row's odd end
+		let mut state = 0x9e3779b97f4a7c15u64;
+		let mut next = || {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			(state >> 32) as u8
+		};
+		for width in [2usize, 16, 30, 50, 258] {
+			let line: Vec<u8> = (0..width).map(|index| if index % 7 == 0 { 255 - (next() % 48) } else { next() }).collect();
+			let pairs: Vec<u8> = (0..width).map(|_| 96 + next() % 64).collect();
+			assert_eq!(row_levels(&line, &pairs), row_levels_plain(&line, &pairs, 0), "a row {width} wide");
+		}
 	}
 
 	#[test]

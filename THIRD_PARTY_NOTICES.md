@@ -1,9 +1,9 @@
 # Third-party notices
 
 ror is licensed under the GNU General Public License, version 2 or (at your option) any later version
-([LICENSE](LICENSE)), GPL-2.0-or-later for short. It builds on the third-party components below, each under its own license. Nothing from Roblox is bundled: Studio's built-in
-textures, meshes, skies, cloud volumes and fonts are read from the user's own Studio install at run
-time, and assets are downloaded from Roblox on demand into the user's cache.
+([LICENSE](LICENSE)), GPL-2.0-or-later for short. It builds on the third-party components below, each under its own license. Nothing from Roblox is bundled: Roblox's built-in
+textures, meshes, skies, cloud volumes and fonts are read from the user's own Roblox install (the Player or
+Studio) at run time, and assets are downloaded from Roblox on demand into the user's cache.
 
 ## x264 (only with the `x264` feature)
 
@@ -50,6 +50,12 @@ time, and assets are downloaded from Roblox on demand into the user's cache.
 > OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 > IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 > DEALINGS IN THE SOFTWARE.
+
+- `crates/ror/src/nvenc.rs`: the structure layouts, constants and identifiers of NVIDIA's encoder
+  interface follow `nvEncodeAPI.h` (NVENC API 12.0, as
+  [nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) n12.0.16.1 carries it), Copyright (c)
+  2010-2022 NVIDIA Corporation, under the MIT license above. The encoder itself is the installed
+  driver's; none of it is distributed with ror.
 
 - `crates/ror-image/src/bc.rs`: the BCn decoders follow the arithmetic of
   [bcdec](https://github.com/iOrange/bcdec) by iOrange, licensed MIT OR Unlicense; used here

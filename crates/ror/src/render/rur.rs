@@ -35,7 +35,7 @@ fn plain(path: &Path) -> PathBuf {
 pub fn locate() -> Option<PathBuf> {
 	let candidate = match std::env::var_os("ROR_RUR") {
 		Some(path) if !path.is_empty() => PathBuf::from(path),
-		_ => crate::output::repo_dir().join("..").join("roblox-ui-renderer"),
+		_ => crate::output::checkout_dir()?.join("..").join("roblox-ui-renderer"),
 	};
 	let candidate = plain(&candidate);
 	candidate.join("cli").join("rur.mjs").is_file().then_some(candidate)

@@ -36,10 +36,12 @@ ror video Effect.rbxm --playback effect.json --start 0.2 --fps 60
   `{"at": <s>, "cframe": [x, y, z, R00 ... R22], "fov": <deg>}` (ree's `camera.json`), each held from
   its moment until the next and the first before its own. Emitters that camera could not draw stand
   still meanwhile, neither emitting nor ageing, as Studio leaves them.
-- Output, in `--out` (default `.cache/out/<input>-video`), at `--size WxH` (default 1920x1080, even
-  for mp4 and webm): `video.mp4` (H.264), or another of the [formats](#formats) with `--format`
-  (`webm`, `gif`, `apng`, `png`). The summary's `views` hold the
-  first frame's camera: `ror render <input> --views <view> --camera-from <out>` draws a still from it.
+- Output, in `--out` (default `<state dir>/out/<input>-video`: the
+  [state folder](building.md#standalone-commands-and-state), `<checkout>/.cache` in a checkout), at
+  `--size WxH` (default 1920x1080, even for mp4 and webm): `video.mp4` (H.264), or another of the
+  [formats](#formats) with `--format` (`webm`, `gif`, `apng`, `png`). The summary's `views` hold the
+  first frame's camera: `ror render <input> --views <view> --camera-from <out>` draws a still from
+  it.
 
 ### The sheet first
 
@@ -60,7 +62,8 @@ encoder takes, with `args` as its output options between that input and the file
 `copies` say which were `written`, why one was not (`error`, also a warning) and how long the clip
 waited for each after its own file (`waitedMs`). A smaller copy to share made so (NVENC at a planned
 bitrate) was ready 0.3 s after a 4K clip, where encoding it from the clip afterwards took 2.4 s with
-NVENC, 5.9 s with x264's two passes.
+NVENC, 5.9 s with x264's two passes. A clip wanted only at that size is cheaper encoded once, by
+`--nvenc` ([Encoders](#encoders)).
 
 
 ## Formats
@@ -90,6 +93,18 @@ NVENC, 5.9 s with x264's two passes.
 - `libx264`: ffmpeg's libx264 through a pipe. Without the `x264` feature this is what `auto` uses.
 - `h264_nvenc`: NVIDIA's encoder through ffmpeg (`p1`, VBR CQ 19, spatial AQ); ror checks that NVENC
   opens at the requested size and falls back to libx264 if it cannot.
+
+`--nvenc <quality>[:<kbps>]` (a job's `nvenc`) encodes an MP4 on NVIDIA's hardware encoder inside
+ror's process instead, whatever `ROR_VIDEO_ENCODER` says: constant quality (1-51, lower is better),
+spending at most `kbps` kilobits a second, so a clip of a known length fits a size. The frames go
+from their readback into the driver's buffer and the encoding is the GPU's encoder block's work: a
+286-frame 1440p clip took 9.7 s of CPU where x264 and an ffmpeg copy took 20.5, and five such clips
+at once 56 where they took 88. It encodes as ffmpeg's `h264_nvenc` does with `-preset p3 -tune hq
+-rc vbr -cq <quality> -maxrate <kbps>k -bf 3 -rc-lookahead 8 -spatial-aq 1`: a 9.5 s clip came out
+the size and PSNR of that ffmpeg copy (8.50 MB, 47.09 dB against the frames). B-frames reorder the
+stream, so the MP4 carries composition offsets and an edit list. It needs an NVIDIA GPU and its
+driver (`nvEncodeAPI64.dll`, `nvcuda.dll`; 522.25 or later): without one the clip fails naming it,
+and the caller encodes another way.
 
 The settings: x264's `ultrafast` preset at CRF 19, 6 frame threads below 4K and 8 from it, so a clip's
 bytes are the same on any machine. Against the `veryfast` CRF 17 used before, one 1080p clip encodes

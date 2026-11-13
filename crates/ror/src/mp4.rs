@@ -7,8 +7,9 @@
 //! Timing as ffmpeg's: a track time scale of the frame rate's numerator doubled until it is 10,000 or
 //! more (30 fps: 15,360, each frame 512 ticks), the movie's in milliseconds, one edit from 0. The
 //! colour as the stream's VUI says it (an `nclx` `colr`: BT.709 primaries and matrix, the sRGB transfer,
-//! limited range). Frames with B-frames between them (a decode order apart from the display order) are
-//! refused: ror's preset has none.
+//! limited range). Frames come in decode order: x264's preset has no B-frames, so that is the display
+//! order; an encoder with B-frames ([`crate::nvenc`]) names each frame's place in the display order, kept
+//! as composition offsets (`ctts`) with the edit starting at the first frame shown.
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -30,6 +31,11 @@ pub struct Mp4Writer {
 	sizes: Vec<u32>,
 	offsets: Vec<u64>,
 	keyframes: Vec<u32>,
+	/// Each frame's place in the display order, where any is out of it (B-frames)
+	order: Vec<u32>,
+	reordered: bool,
+	/// The encoder's name in the sample entry
+	label: &'static str,
 	frames: usize,
 	/// Where the index's room starts and how long it is; where the frames' box starts
 	room_at: u64,
@@ -74,8 +80,10 @@ pub fn frame_rate(fps: f32) -> (u32, u32) {
 
 impl Mp4Writer {
 	/// Starts `path` for `frames` frames of `width` x `height` at `fps` (a fraction), the stream's SPS
-	/// and PPS as given (no lengths).
-	pub fn create(path: &Path, width: u32, height: u32, fps: (u32, u32), sps: &[u8], pps: &[u8], frames: usize) -> Result<Self> {
+	/// and PPS as given (no lengths), from the encoder `label` names; `reordered`: its frames may come
+	/// out of display order ([`Mp4Writer::write_at`]).
+	#[allow(clippy::too_many_arguments)]
+	pub fn create(path: &Path, width: u32, height: u32, fps: (u32, u32), sps: &[u8], pps: &[u8], frames: usize, label: &'static str, reordered: bool) -> Result<Self> {
 		if sps.len() < 4 || pps.is_empty() {
 			bail!("mp4: no SPS or PPS");
 		}
@@ -97,6 +105,9 @@ impl Mp4Writer {
 			sizes: Vec::with_capacity(frames),
 			offsets: Vec::with_capacity(frames),
 			keyframes: Vec::new(),
+			order: Vec::new(),
+			reordered,
+			label,
 			frames,
 			room_at: 0,
 			room: 0,
@@ -109,7 +120,8 @@ impl Mp4Writer {
 		// frame is a keyframe) of all but one; and the room for a free box's header after it
 		writer.room_at = ftyp.len() as u64;
 		let stss = 16 + 4 * frames as u64;
-		writer.room = writer.moov(&vec![0; frames], &vec![u64::MAX; frames], &(1..=frames as u32).collect::<Vec<_>>(), frames).len() as u64 + stss + 8;
+		let ctts = if reordered { 16 + 8 * frames as u64 } else { 0 };
+		writer.room = writer.moov(&vec![0; frames], &vec![u64::MAX; frames], &(1..=frames as u32).collect::<Vec<_>>(), frames).len() as u64 + stss + ctts + 8;
 		writer.file.write_all(&free(writer.room))?;
 		writer.mdat_at = writer.room_at + writer.room;
 		// the frames' box, 64-bit sized: its size is written at the end
@@ -120,6 +132,18 @@ impl Mp4Writer {
 
 	/// Adds the next frame: its NAL units with 4-byte lengths, in display order.
 	pub fn write(&mut self, data: &[u8], keyframe: bool) -> Result<()> {
+		self.write_at(data, keyframe, self.sizes.len())
+	}
+
+	/// Adds the next frame in decode order, shown as the clip's frame `display` (from 0).
+	pub fn write_at(&mut self, data: &[u8], keyframe: bool, display: usize) -> Result<()> {
+		if display != self.sizes.len() && !self.reordered {
+			bail!("mp4: frame {display} came as number {}: frames out of order", self.sizes.len());
+		}
+		if display >= self.frames {
+			bail!("mp4: a frame shown at {display} of {} frames", self.frames);
+		}
+		self.order.push(display as u32);
 		if self.sizes.len() >= self.frames {
 			bail!("mp4: more than the {} frames it was started for", self.frames);
 		}
@@ -172,7 +196,16 @@ impl Mp4Writer {
 		tkhd.extend(be32(&MATRIX));
 		tkhd.extend(be32(&[self.width << 16, self.height << 16]));
 		let tkhd = full(b"tkhd", 0, 3, &tkhd);
-		let elst = full(b"elst", 0, 0, &be32(&[1, duration, 0, 0x0001_0000]));
+		// frames out of display order: each decoded `delay` frames before the earliest it could be shown,
+		// its offset from there to its place, and the edit starting where the first frame shows
+		let delay = self.order.iter().enumerate().map(|(index, &display)| (index as u32).saturating_sub(display)).max().unwrap_or(0);
+		let ctts = if delay == 0 {
+			Vec::new()
+		} else {
+			let offsets: Vec<u32> = self.order.iter().enumerate().flat_map(|(index, &display)| [1, (display + delay - index as u32) * self.delta]).collect();
+			full(b"ctts", 0, 0, &[&be32(&[self.order.len() as u32])[..], &be32(&offsets)].concat())
+		};
+		let elst = full(b"elst", 0, 0, &be32(&[1, duration, delay * self.delta, 0x0001_0000]));
 		let edts = boxed(b"edts", &elst);
 
 		let mut mdhd = be32(&[0, 0, self.timescale, media_duration as u32]);
@@ -198,7 +231,7 @@ impl Mp4Writer {
 		} else {
 			full(b"stco", 0, 0, &[&be32(&[frames as u32])[..], &be32(&offsets.iter().map(|&offset| offset as u32).collect::<Vec<u32>>())].concat())
 		};
-		let stbl = boxed(b"stbl", &[stsd, stts, stss, stsc, stsz, chunks].concat());
+		let stbl = boxed(b"stbl", &[stsd, stts, ctts, stss, stsc, stsz, chunks].concat());
 		let minf = boxed(b"minf", &[vmhd, dinf, stbl].concat());
 		let mdia = boxed(b"mdia", &[mdhd, hdlr, minf].concat());
 		let trak = boxed(b"trak", &[tkhd, edts, mdia].concat());
@@ -215,7 +248,7 @@ impl Mp4Writer {
 		entry.extend(be32(&[0x0048_0000, 0x0048_0000, 0]));
 		entry.extend_from_slice(&1u16.to_be_bytes());
 		let mut name = [0u8; 32];
-		let label = b"ror x264";
+		let label = self.label.as_bytes();
 		name[0] = label.len() as u8;
 		name[1..=label.len()].copy_from_slice(label);
 		entry.extend_from_slice(&name);
@@ -264,7 +297,7 @@ mod tests {
 		let path = dir.join("clip.mp4");
 		let sps = [0x67, 0x42, 0xc0, 0x1e, 0xda];
 		let pps = [0x68, 0xce, 0x0f, 0xc8];
-		let mut writer = Mp4Writer::create(&path, 64, 48, (30, 1), &sps, &pps, 3).unwrap();
+		let mut writer = Mp4Writer::create(&path, 64, 48, (30, 1), &sps, &pps, 3, "ror x264", false).unwrap();
 		for (index, size) in [10usize, 20, 30].into_iter().enumerate() {
 			writer.write(&vec![index as u8 + 1; size], index == 0).unwrap();
 		}
@@ -293,7 +326,23 @@ mod tests {
 		let stco = find("stco").unwrap();
 		let first = u32::from_be_bytes(bytes[stco + 12..stco + 16].try_into().unwrap()) as usize;
 		assert_eq!(&bytes[first..first + 10], &[1u8; 10]);
-		assert!(Mp4Writer::create(&path, 64, 48, (30, 1), &sps, &pps, 1).unwrap().finish().is_err(), "a frame short");
+		assert!(find("ctts").is_none(), "frames in display order have no composition offsets");
+		assert!(Mp4Writer::create(&path, 64, 48, (30, 1), &sps, &pps, 1, "ror x264", false).unwrap().finish().is_err(), "a frame short");
+		// decoded I P B B, shown I B B P: each frame's offset from its decode time, the edit a frame in
+		let mut writer = Mp4Writer::create(&path, 64, 48, (30, 1), &sps, &pps, 4, "ror nvenc", true).unwrap();
+		for (index, display) in [0usize, 3, 1, 2].into_iter().enumerate() {
+			writer.write_at(&[index as u8; 8], index == 0, display).unwrap();
+		}
+		writer.finish().unwrap();
+		let bytes = std::fs::read(&path).unwrap();
+		let at = |kind: &str| bytes.windows(4).position(|window| window == kind.as_bytes()).unwrap();
+		let word = |offset: usize| u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+		let ctts = at("ctts");
+		assert_eq!(word(ctts + 8), 4);
+		assert_eq!([word(ctts + 16), word(ctts + 24), word(ctts + 32), word(ctts + 40)], [512, 3 * 512, 0, 0]);
+		assert_eq!(word(at("elst") + 16), 512, "the edit starts at the first frame shown");
+		let mut writer = Mp4Writer::create(&path, 64, 48, (30, 1), &sps, &pps, 2, "ror x264", false).unwrap();
+		assert!(writer.write_at(&[0; 8], true, 1).is_err(), "out of order where none was said");
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
