@@ -298,7 +298,8 @@ mod tests {
 		// a variable or an env file wins
 		let variable = |key: &str| (key == "ROBLOX_ASSET_DELIVERY_COOKIE").then(|| OsString::from("FAKE-ENV"));
 		assert_eq!(source(&variable, None), Some(("FAKE-ENV".into(), CookieSource::Env("ROBLOX_ASSET_DELIVERY_COOKIE"))));
-		let dir = std::env::temp_dir().join(format!("ror-assets-studio-{}", std::process::id()));
+		// its own folder: studio.rs's lookup_order runs beside this test and removes `ror-assets-studio-<pid>`
+		let dir = std::env::temp_dir().join(format!("ror-assets-cookie-file-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		std::fs::write(dir.join(".env"), "ROBLOSECURITY=FAKE-FILE\n").unwrap();
 		assert_eq!(source(&nothing, Some(&dir)), Some(("FAKE-FILE".into(), CookieSource::File(dir.join(".env")))));
