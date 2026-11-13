@@ -6,8 +6,9 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 // The public repository as owner/name. It is derived from the URL because the publishing gate allows the
-// repository's name only in a URL.
-export const REPOSITORY = new URL("https://github.com/Anime-Vanguards/roblox-object-renderer").pathname.slice(1);
+// repository's name only in a URL. A workflow names the repository it runs in, so a fork's release names its own
+// source.
+export const REPOSITORY = process.env.GITHUB_REPOSITORY || new URL("https://github.com/Anime-Vanguards/roblox-object-renderer").pathname.slice(1);
 
 /** Reads `--name value` pairs into an object: `--tag v0.1.0` becomes `{ tag: "v0.1.0" }`. */
 export function args(argv = process.argv.slice(2)) {
@@ -61,7 +62,7 @@ export function write(file, text) {
 
 /** Checks which release a build belongs to and returns it as `{ version, tag, commit, repository }`. */
 export function identity(version, tag, commit, repository = REPOSITORY) {
-	if (!/^\d+\.\d+\.\d+$/.test(version) || tag !== `v${version}`) {
+	if (!/^\d+\.\d+\.\d+(-rodeo\.\d+)?$/.test(version) || tag !== `v${version}`) {
 		throw new Error(`tag ${tag} is not v<manifest version> (manifests say ${version})`);
 	}
 	if (!/^[a-f0-9]{40}$/.test(commit)) {

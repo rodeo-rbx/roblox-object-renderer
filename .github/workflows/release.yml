@@ -14,7 +14,8 @@ on:
   push:
     branches: [main]
     # path filters do not apply to tags, so a tag always runs
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    # The rodeo-rbx fork's releases are tagged v<upstream version>-rodeo.<count>.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-rodeo.[0-9]+']
     paths:
       - .github/workflows/release.yml
       - tools/release/**

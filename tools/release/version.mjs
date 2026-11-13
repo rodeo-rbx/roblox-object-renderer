@@ -17,7 +17,7 @@ function readManifest(root, ...folder) {
 
 export function version(root = ROOT, tag) {
 	const workspace = readManifest(root);
-	const value = tableBody(workspace, "workspace.package").match(/^version\s*=\s*"(\d+\.\d+\.\d+)"/m)?.[1];
+	const value = tableBody(workspace, "workspace.package").match(/^version\s*=\s*"(\d+\.\d+\.\d+(?:-rodeo\.\d+)?)"/m)?.[1];
 	if (!value) throw new Error("Cargo.toml has no [workspace.package] version");
 	const memberList = tableBody(workspace, "workspace").match(/^members\s*=\s*\[([^]*?)\]/m)?.[1];
 	if (!memberList) throw new Error("Cargo.toml has no workspace members");

@@ -3,7 +3,8 @@
 import { ROOT, git, identity, main, sourceText, write } from "./common.mjs";
 import { version } from "./version.mjs";
 
-const RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
+// upstream's releases, and the rodeo-rbx fork's v<version>-rodeo.N ones
+const RELEASE_TAG = /^v\d+\.\d+\.\d+(-rodeo\.\d+)?$/;
 const FENCE = "```";
 
 /** The newest release tag before `commit`, or undefined for the first release. */
