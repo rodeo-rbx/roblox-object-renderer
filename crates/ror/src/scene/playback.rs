@@ -159,13 +159,19 @@ pub struct Action {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parent: Option<String>,
 	/// With an `emit` count: where the burst leaves from, the world CFrame (12 numbers) of the emitter's
-	/// part or attachment at the call, instead of where the playback has that part or attachment at
-	/// the frame. Roblox's `Emit` spawns its particles in the call (not measured here), so a script that
-	/// moves an attachment between calls in one frame leaves a burst at each place, where a frame's
-	/// motion holds one (a recording's emits carry it: ree; one without it is placed by the motion).
+	/// part or attachment, instead of where the playback has that part or attachment at the frame.
+	/// Roblox's `Emit` spawns nothing in the call: its particles start when the frame is next drawn,
+	/// where the emitter is then, so an emitter moved and emitted from several times in one frame
+	/// leaves every burst at the last place (measured, Studio 0.748, a playing client: a part, an
+	/// attachment, and an attachment whose part was moved, each emitting at two places and left at a
+	/// third within one render step, drew all their particles at the third). A recording's emits
+	/// carry that place (ree); one without it is placed by the motion, which is the same place unless
+	/// the motion's keys fall between frames.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cframe: Option<Vec<f32>>,
-	/// With `cframe`, an emitter on a part: the part's Size at the call, which its particles spawn over.
+	/// With `cframe`, an emitter on a part: the part's Size as that frame is drawn, which its particles
+	/// spawn over (measured with the above: a part a stud across at its `Emit` and 28 across by the end
+	/// of the render step spread its particles over the 28).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub part_size: Option<[f32; 3]>,
 }
@@ -1955,8 +1961,8 @@ impl Resolved<'_> {
 				}
 				let age = now - timeline.particle_time(start, at);
 				let lived = spawn_now - timeline.spawn_time(start, at);
-				// where the emitter was at the call when the playback says (several bursts of one frame from
-				// an attachment moved between them), else where its part or attachment is then
+				// where the playback says the burst leaves from (a recording: where its emitter was as the
+				// frame was drawn), else where its part or attachment is then
 				let cframe = emitted.from.unwrap_or_else(|| frame_at(at));
 				let (velocity, size) = (velocity_at(at), emitted.part_size.unwrap_or_else(|| size_at(at)));
 				for index in 0..count * emitter.emit_count.unwrap_or(1) {
@@ -3144,11 +3150,11 @@ mod tests {
 		assert!((390..=410).contains(&alive), "{alive}");
 	}
 
-	/// A recording's bursts leave from where their emitter was at the call (`cframe`, and a part's
-	/// `partSize`): an attachment moved to four corners in one frame, emitting after each move (an effect
-	/// that locks its rectangle so), draws four bursts at four corners where its motion
-	/// holds the last corner only; without them every burst is where the motion has the emitter, as
-	/// before.
+	/// A burst leaves from where its action says (`cframe`, and a part's `partSize`) whatever the motion
+	/// has for its emitter then: four bursts of one frame given four corners are drawn at the four, and
+	/// two of a part's each over the part given; without them every burst is where the motion has the
+	/// emitter. (A recording of a real effect gives one frame's bursts one place, where the emitter is as
+	/// the frame is drawn: [`Action::cframe`]. This is what the fields do, not what an engine does.)
 	#[test]
 	fn each_burst_leaves_from_where_its_emit_says() {
 		use crate::scene::build::{ModelBuilder, PartSpec};
